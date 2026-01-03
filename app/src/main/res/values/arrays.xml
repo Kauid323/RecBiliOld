@@ -1,0 +1,5 @@
+<resources>
+    <string-array name="xposedscope">
+        <item>com.bilibili.app.blue</item>
+    </string-array>
+</resources>
