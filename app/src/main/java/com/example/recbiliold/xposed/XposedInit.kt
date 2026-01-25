@@ -38,6 +38,101 @@ class XposedInit : IXposedHookLoadPackage {
         }
     }
 
+    private fun hookCommentActivityIntentCaptureIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // Capture CommentActivity extras (oid/rpId/type) to improve fullAid restoration.
+        // The legacy client may pass overflowed signed32 values; caching helps correlation/debug.
+        try {
+            XposedHelpers.findAndHookMethod(
+                android.app.Activity::class.java,
+                "startActivityForResult",
+                android.content.Intent::class.java,
+                Int::class.javaPrimitiveType,
+                android.os.Bundle::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val intent = param.args.getOrNull(0) as? android.content.Intent ?: return
+                            captureCommentActivityIntentIfAny(intent)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            )
+        } catch (_: Throwable) {
+        }
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                android.app.Activity::class.java,
+                "startActivityForResult",
+                android.content.Intent::class.java,
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val intent = param.args.getOrNull(0) as? android.content.Intent ?: return
+                            captureCommentActivityIntentIfAny(intent)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            )
+        } catch (_: Throwable) {
+        }
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                android.app.Activity::class.java,
+                "startActivity",
+                android.content.Intent::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val intent = param.args.getOrNull(0) as? android.content.Intent ?: return
+                            captureCommentActivityIntentIfAny(intent)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun captureCommentActivityIntentIfAny(intent: android.content.Intent) {
+        try {
+            val cn = try { intent.component?.className } catch (_: Throwable) { null }
+            if (cn.isNullOrBlank()) return
+            if (!cn.endsWith("CommentActivity")) return
+
+            val extras = try { intent.extras } catch (_: Throwable) { null } ?: return
+            val oid = try {
+                when {
+                    extras.containsKey("oid") -> extras.get("oid")?.toString()
+                    else -> null
+                }
+            } catch (_: Throwable) { null }
+
+            val rpid = try {
+                when {
+                    extras.containsKey("rpId") -> extras.get("rpId")?.toString()
+                    extras.containsKey("rpid") -> extras.get("rpid")?.toString()
+                    else -> null
+                }
+            } catch (_: Throwable) { null }
+
+            val type = try {
+                when {
+                    extras.containsKey("type") -> extras.get("type")?.toString()
+                    else -> null
+                }
+            } catch (_: Throwable) { null }
+
+            PlayurlFixer.setLastCommentContext(oid = oid, rpid = rpid, type = type)
+        } catch (_: Throwable) {
+        }
+    }
+
     private val bundledRespBodyCache = WeakHashMap<Any, String>()
     private val bundledIngestGuard = object : ThreadLocal<Boolean>() {
         override fun initialValue(): Boolean = false
@@ -1390,6 +1485,120 @@ class XposedInit : IXposedHookLoadPackage {
         }
     }
 
+    private fun tryPatchOkHttpResponseBodyIfComment(responseObj: Any): Any? {
+        try {
+            val req = XposedHelpers.callMethod(responseObj, "request") ?: return null
+            val urlObj = XposedHelpers.callMethod(req, "url") ?: return null
+            val url = urlObj.toString()
+            if (!url.contains("/x/v2/reply/wbi/main", ignoreCase = true)) return null
+
+            val peeked = XposedHelpers.callMethod(responseObj, "peekBody", 1024L * 1024L) ?: return null
+            val bodyStr = XposedHelpers.callMethod(peeked, "string") as? String ?: return null
+            if (bodyStr.isBlank()) return null
+
+            val patched = run {
+                try {
+                    val root = JSONObject.parseObject(bodyStr) ?: return@run null
+                    val data = root.getJSONObject("data") ?: return@run null
+
+                    // Only patch if this looks like the wbi/main shape.
+                    if (!data.containsKey("cursor")) return@run null
+
+                    val cursor = data.getJSONObject("cursor")
+
+                    val pageObj = JSONObject()
+                    pageObj["num"] = 1
+                    pageObj["size"] = run {
+                        // Try parse ps from request URL; fall back to 20.
+                        try {
+                            val query = try {
+                                java.net.URI(url).rawQuery.orEmpty()
+                            } catch (_: Throwable) {
+                                url.substringAfter('?', "")
+                            }
+                            val ps = query.split('&')
+                                .firstOrNull { it.startsWith("ps=", ignoreCase = true) }
+                                ?.substringAfter('=')
+                                ?.toIntOrNull()
+                            ps ?: 20
+                        } catch (_: Throwable) {
+                            20
+                        }
+                    }
+                    val allCount = try { cursor?.getLongValue("all_count") } catch (_: Throwable) { 0L }
+                    pageObj["count"] = allCount
+                    pageObj["acount"] = allCount
+
+                    // Legacy /x/v2/reply expects `page`, and `top` to be either null or a comment object.
+                    // wbi/main returns `top` as an object wrapper; set it to null to avoid model mismatch.
+                    data["page"] = pageObj
+                    data["top"] = null
+
+                    // Keep existing fields that are still compatible: replies/hots/notice/upper/config/control/folder...
+                    // Remove `cursor` to prevent older parsers from choking on unexpected structures.
+                    data.remove("cursor")
+
+                    root.toJSONString()
+                } catch (_: Throwable) {
+                    null
+                }
+            } ?: return null
+
+            val newBody = run {
+                val body = XposedHelpers.callMethod(responseObj, "body")
+                val mediaType = try { XposedHelpers.callMethod(body, "contentType") } catch (_: Throwable) { null }
+
+                // okhttp3.ResponseBody.create(MediaType, String)
+                try {
+                    val rbClazz = XposedHelpers.findClass("okhttp3.ResponseBody", responseObj.javaClass.classLoader)
+                    val create = rbClazz.declaredMethods.firstOrNull { m ->
+                        Modifier.isStatic(m.modifiers) && m.name == "create" && m.parameterTypes.size == 2 &&
+                            m.parameterTypes[0].name == "okhttp3.MediaType" && m.parameterTypes[1] == String::class.java
+                    }
+                    if (create != null) {
+                        create.isAccessible = true
+                        return@run create.invoke(null, mediaType, patched)
+                    }
+                } catch (_: Throwable) {
+                }
+
+                // okhttp3.ResponseBody.Companion.create(String, MediaType?) (OkHttp 4)
+                try {
+                    val rbClazz = XposedHelpers.findClass("okhttp3.ResponseBody", responseObj.javaClass.classLoader)
+                    val companion = rbClazz.declaredFields.firstOrNull { it.name == "Companion" }?.let { f ->
+                        f.isAccessible = true
+                        f.get(null)
+                    }
+                    if (companion != null) {
+                        val create = companion.javaClass.declaredMethods.firstOrNull { m ->
+                            m.name == "create" && m.parameterTypes.size == 2 &&
+                                m.parameterTypes[0] == String::class.java && m.parameterTypes[1].name == "okhttp3.MediaType"
+                        }
+                        if (create != null) {
+                            create.isAccessible = true
+                            return@run create.invoke(companion, patched, mediaType)
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+
+                null
+            } ?: return null
+
+            val newResp = run {
+                val nb = XposedHelpers.callMethod(responseObj, "newBuilder") ?: return@run null
+                XposedHelpers.callMethod(nb, "body", newBody)
+                XposedHelpers.callMethod(nb, "build")
+            } ?: return null
+
+            XposedBridge.log("RecBiliOld: patch comment response wbi/main -> legacy reply shape url=$url")
+            return newResp
+        } catch (t: Throwable) {
+            XposedBridge.log(t)
+            return null
+        }
+    }
+
     private fun tryPatchOkHttpResponseBodyIfView(responseObj: Any): Any? {
         try {
             val req = XposedHelpers.callMethod(responseObj, "request") ?: return null
@@ -1675,6 +1884,7 @@ class XposedInit : IXposedHookLoadPackage {
             hookLuaHttpIfPresent(lpparam)
             hookOversizedAvidIfPresent(lpparam)
             hookForceNormalVideoPathIfPresent(lpparam)
+            hookCommentActivityIntentCaptureIfPresent(lpparam)
             hookOkHttpDesktopHeadersIfPresent(lpparam)
             hookBundledDesktopHeadersIfPresent(lpparam)
             hookOkHttpViewResponseIfPresent(lpparam)
@@ -1744,6 +1954,12 @@ class XposedInit : IXposedHookLoadPackage {
                                     " extrasKeys=${keys.joinToString(prefix = "[", postfix = "]") }"
                             )
 
+                            try {
+                                tryFixVideoDetailsAvidZero(intent)
+                            } catch (t: Throwable) {
+                                XposedBridge.log(t)
+                            }
+
                             val removed = sanitizeVideoDetailsIntent(intent, preferAggressive = fromUpSpace)
                             if (removed.isNotEmpty()) {
                                 XposedBridge.log("RecBiliOld: fat.m25088a sanitized VideoDetailsActivity removed=${removed.joinToString(prefix = "[", postfix = "]")}")
@@ -1788,6 +2004,12 @@ class XposedInit : IXposedHookLoadPackage {
                                         " data=${dataStr ?: "<null>"}" +
                                         " extrasKeys=${keys.joinToString(prefix = "[", postfix = "]")}"
                                 )
+
+                                try {
+                                    tryFixVideoDetailsAvidZero(intent)
+                                } catch (t: Throwable) {
+                                    XposedBridge.log(t)
+                                }
 
                                 val removed = sanitizeVideoDetailsIntent(intent, preferAggressive = true)
                                 if (removed.isNotEmpty()) {
@@ -1861,6 +2083,129 @@ class XposedInit : IXposedHookLoadPackage {
         return removed
     }
 
+    private fun tryFixVideoDetailsAvidZero(intent: android.content.Intent) {
+        val extras = try { intent.extras } catch (_: Throwable) { null } ?: return
+
+        fun readLongExtra(key: String): Long? {
+            return try {
+                if (!intent.hasExtra(key)) return null
+                val v = extras.get(key)
+                when (v) {
+                    is Long -> v
+                    is Int -> v.toLong()
+                    is String -> v.toLongOrNull()
+                    else -> null
+                }
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        val avid = readLongExtra("avid") ?: readLongExtra("aid") ?: return
+
+        val clickedAid = try { PlayurlFixer.getLastClickedAid() } catch (_: Throwable) { null }
+        val clickedAidLong = clickedAid?.toLongOrNull()
+
+        // If we have a recent full 64-bit aid from card click, and current avid looks invalid/truncated,
+        // force override.
+        if (clickedAidLong != null && clickedAidLong > Int.MAX_VALUE.toLong()) {
+            val looksTruncated = avid == 0L || avid < 0L || avid <= Int.MAX_VALUE.toLong()
+            if (looksTruncated && clickedAidLong.toString() != avid.toString()) {
+                try {
+                    intent.putExtra("avid", clickedAidLong)
+                } catch (_: Throwable) {
+                }
+                try {
+                    intent.putExtra("aid", clickedAidLong)
+                } catch (_: Throwable) {
+                }
+                XposedBridge.log("RecBiliOld: force VideoDetailsActivity avid -> lastClickedAid=$clickedAidLong (was $avid)")
+                return
+            }
+        }
+
+        if (avid != 0L) return
+
+        var fixedAid: Long? = null
+
+        // 1) Try extract from embedded BiliVideo extra if present.
+        try {
+            val v = extras.get("video")
+            if (v != null) {
+                val candidates = arrayOf("aid", "avid", "avId", "av_id", "AID", "AVID")
+                for (name in candidates) {
+                    try {
+                        val f = v.javaClass.declaredFields.firstOrNull { it.name == name }
+                        if (f != null) {
+                            f.isAccessible = true
+                            val fv = f.get(v)
+                            val n = when (fv) {
+                                is Long -> fv
+                                is Int -> fv.toLong()
+                                is String -> fv.toLongOrNull()
+                                else -> null
+                            }
+                            if (n != null && n > 0L) {
+                                fixedAid = n
+                                break
+                            }
+                        }
+                    } catch (_: Throwable) {
+                    }
+                }
+
+                if (fixedAid == null) {
+                    // Try 0-arg getters.
+                    val methods = arrayOf("getAid", "getAvid", "aid", "avid")
+                    for (mn in methods) {
+                        try {
+                            val m = v.javaClass.declaredMethods.firstOrNull { it.name == mn && it.parameterTypes.isEmpty() }
+                            if (m != null) {
+                                m.isAccessible = true
+                                val r = m.invoke(v)
+                                val n = when (r) {
+                                    is Long -> r
+                                    is Int -> r.toLong()
+                                    is String -> r.toLongOrNull()
+                                    else -> null
+                                }
+                                if (n != null && n > 0L) {
+                                    fixedAid = n
+                                    break
+                                }
+                            }
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+
+        // 2) Fallback: use last persisted aid (if user just came from a view request).
+        if (fixedAid == null) {
+            try {
+                val p = PlayurlFixer.getPersistedAidBvidForJump()
+                val a = p?.first?.toLongOrNull()
+                if (a != null && a > 0L) fixedAid = a
+            } catch (_: Throwable) {
+            }
+        }
+
+        val realAid = fixedAid ?: return
+
+        try {
+            intent.putExtra("avid", realAid)
+        } catch (_: Throwable) {
+        }
+        try {
+            intent.putExtra("aid", realAid)
+        } catch (_: Throwable) {
+        }
+
+        XposedBridge.log("RecBiliOld: fix VideoDetailsActivity avid=0 -> $realAid")
+    }
+
     private fun hookBundledViewAidBuildTimeRewriteIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
         val cl = lpparam.classLoader
         val builderClazz =
@@ -1896,6 +2241,53 @@ class XposedInit : IXposedHookLoadPackage {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val urlObj = param.args.getOrNull(0) ?: return
                         val urlStr = try { urlObj.toString() } catch (_: Throwable) { return }
+
+                        try {
+                            if (isViewUrl(urlStr)) {
+                                val m = Regex("(?i)(?:[?&])aid=(-?\\d+)(?:&|$)").find(urlStr)
+                                val aidRaw = m?.groupValues?.getOrNull(1)
+                                val aidLong = aidRaw?.toLongOrNull()
+
+                                // 1) Restore truncated aid from low32->fullAid mapping (rank/feed list source)
+                                val restored = try { PlayurlFixer.resolveFullAidByLow32(aidRaw) } catch (_: Throwable) { null }
+                                if (!restored.isNullOrBlank() && restored != aidRaw) {
+                                    val fixedUrl = urlStr.replace(
+                                        Regex("(?i)([?&]aid=)(-?\\d+)(?=&|$)"),
+                                        "${'$'}1$restored"
+                                    )
+                                    if (fixedUrl != urlStr) {
+                                        val newHttpUrl = try { parseMethod.invoke(null, fixedUrl) } catch (_: Throwable) { null }
+                                        if (newHttpUrl != null) {
+                                            param.args[0] = newHttpUrl
+                                            XposedBridge.log("RecBiliOld: bundled restore view aid $aidRaw -> $restored")
+                                            return
+                                        }
+                                    }
+                                }
+
+                                // 2) Negative overflow: convert to unsigned32.
+                                if (aidLong != null && aidLong < 0) {
+                                    val fixedAid = (aidLong and 0xFFFF_FFFFL)
+                                    val fixedUrl = urlStr.replace(
+                                        Regex("(?i)([?&]aid=)(-?\\d+)(?=&|$)"),
+                                        "${'$'}1$fixedAid"
+                                    )
+                                    if (fixedUrl != urlStr) {
+                                        val newHttpUrl = try {
+                                            parseMethod.invoke(null, fixedUrl)
+                                        } catch (_: Throwable) {
+                                            null
+                                        }
+                                        if (newHttpUrl != null) {
+                                            param.args[0] = newHttpUrl
+                                            XposedBridge.log("RecBiliOld: bundled rewrite view aid $aidRaw -> $fixedAid")
+                                            return
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (_: Throwable) {
+                        }
 
                         // Rewrite danmaku cid (bundled stack): comment.bilibili.com/<cid>.xml
                         try {
@@ -2105,6 +2497,11 @@ class XposedInit : IXposedHookLoadPackage {
                         val aidLong = extractAidFromUriStringLong(uriStr) ?: return
                         if (aidLong <= 0L) return
 
+                        try {
+                            PlayurlFixer.setLastClickedAid(aidLong.toString())
+                        } catch (_: Throwable) {
+                        }
+
                         if (aidLong <= Int.MAX_VALUE.toLong()) {
                             val aid = aidLong.toInt()
                             val key = "fatUriAvid=$aid"
@@ -2217,6 +2614,11 @@ class XposedInit : IXposedHookLoadPackage {
                         } catch (_: Throwable) {
                             null
                         } ?: return
+
+                        try {
+                            PlayurlFixer.setLastClickedAid(avidStr)
+                        } catch (_: Throwable) {
+                        }
 
                         val avidLong = avidStr.toLongOrNull() ?: return
                         if (avidLong <= 0L) return
@@ -2526,15 +2928,21 @@ class XposedInit : IXposedHookLoadPackage {
         fun redirectIfNeeded(ctx: Any?, avid: Int): Boolean {
             if (ctx !is android.content.Context) return false
             if (avid != Int.MAX_VALUE) return false
-            val persisted = PlayurlFixer.getPersistedAidBvidForJump() ?: return false
-            val aid = persisted.first
-            val bvid = persisted.second
-            val target = if (!bvid.isNullOrBlank()) {
-                "bilibili://video/$bvid"
-            } else if (!aid.isNullOrBlank()) {
-                "bilibili://video/$aid"
+
+            val clickedAid = try { PlayurlFixer.getLastClickedAid() } catch (_: Throwable) { null }
+            val target = if (!clickedAid.isNullOrBlank()) {
+                "bilibili://video/$clickedAid"
             } else {
-                return false
+                val persisted = PlayurlFixer.getPersistedAidBvidForJump() ?: return false
+                val aid = persisted.first
+                val bvid = persisted.second
+                if (!bvid.isNullOrBlank()) {
+                    "bilibili://video/$bvid"
+                } else if (!aid.isNullOrBlank()) {
+                    "bilibili://video/$aid"
+                } else {
+                    return false
+                }
             }
 
             try {
@@ -2885,20 +3293,31 @@ class XposedInit : IXposedHookLoadPackage {
 
             val req = try {
                 XposedHelpers.callMethod(callObj, "a")
-            } catch (t: Throwable) {
+            } catch (_: Throwable) {
                 null
-            } ?: return
-            
-            val url = extractUrlFromRequestLike(req) ?: return
+            }
+
+            val reqCandidate = (req ?: req0) ?: return
+            val urlCandidate = extractUrlFromRequestLike(reqCandidate) ?: url0
+            val url = urlCandidate ?: return
 
             try {
-                maybeInjectDesktopHeadersForBundledCall(callObj, req, url)
+                if (url.contains("/x/v2/reply", ignoreCase = true)) {
+                    if (bundledUrlFailOnce.add("bundled-reply-req:" + url.take(160))) {
+                        XposedBridge.log("RecBiliOld: [bundled-reply-req] url=${url.take(220)}")
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+
+            try {
+                maybeInjectDesktopHeadersForBundledCall(callObj, reqCandidate, url)
             } catch (t: Throwable) {
                 XposedBridge.log(t)
             }
 
             try {
-                maybeRewriteCommentForBundledCall(callObj, req, url)
+                maybeRewriteCommentForBundledCall(callObj, reqCandidate, url)
             } catch (t: Throwable) {
                 XposedBridge.log(t)
             }
@@ -3057,9 +3476,142 @@ class XposedInit : IXposedHookLoadPackage {
     }
 
     private fun maybeRewriteCommentForBundledCall(callObj: Any, reqObj: Any, url: String) {
-        if (!url.contains("api.bilibili.com/x/v2/reply", ignoreCase = true)) return
+        if (!url.contains("/x/v2/reply", ignoreCase = true)) return
 
         XposedBridge.log("RecBiliOld: seen legacy comment url=$url")
+
+        // Request-stage rewrite for nested replies: /x/v2/reply/reply
+        // Goal: avoid sending negative/truncated oid at all.
+        try {
+            if (url.contains("/x/v2/reply/reply", ignoreCase = true)) {
+                val oidRaw0 = parseQueryParam(url, "oid")
+                val type0 = parseQueryParam(url, "type")
+                val root0 = parseQueryParam(url, "root")
+                val cachedRoot = try { PlayurlFixer.getLastCommentContextRpid() } catch (_: Throwable) { null }
+                val rootFixed0 = run {
+                    val r0 = root0?.takeIf { it.isNotBlank() } ?: cachedRoot?.takeIf { it.isNotBlank() }
+                    if (r0.isNullOrBlank()) return@run null
+                    val rn = r0.toLongOrNull()
+                    if (rn != null && rn < 0) (rn and 0xFFFF_FFFFL).toString() else r0
+                }
+
+                if (!oidRaw0.isNullOrBlank() && !type0.isNullOrBlank()) {
+                    val oidFixed = run {
+                        try {
+                            val normalizedForLookup = run {
+                                val n0 = oidRaw0.toLongOrNull()
+                                if (n0 != null && n0 < 0) (n0 and 0xFFFF_FFFFL).toString() else oidRaw0
+                            }
+                            val restored = PlayurlFixer.resolveFullAidByLow32(normalizedForLookup)
+                            if (!restored.isNullOrBlank() && restored != oidRaw0) {
+                                return@run restored
+                            }
+                        } catch (_: Throwable) {
+                        }
+
+                        // Prefer cached CommentActivity oid only when it is a full 64-bit aid.
+                        try {
+                            val cached = PlayurlFixer.getLastCommentContextOid()
+                            val c = cached?.toLongOrNull()
+                            if (c != null && c > Int.MAX_VALUE.toLong()) {
+                                return@run c.toString()
+                            }
+                        } catch (_: Throwable) {
+                        }
+
+                        val n = oidRaw0.toLongOrNull()
+                        if (n != null && n < 0) (n and 0xFFFF_FFFFL).toString() else oidRaw0
+                    }
+
+                    if (oidFixed != oidRaw0) {
+                        val base = url.substringBefore('?', url)
+                        val query0 = url.substringAfter('?', "")
+                        val qp = LinkedHashMap<String, String>()
+                        if (query0.isNotBlank()) {
+                            for (p in query0.split('&')) {
+                                if (p.isBlank()) continue
+                                val idx = p.indexOf('=')
+                                val k = if (idx >= 0) p.substring(0, idx) else p
+                                val v = if (idx >= 0) p.substring(idx + 1) else ""
+                                qp[k] = v
+                            }
+                        }
+                        qp["oid"] = oidFixed
+                        if (!rootFixed0.isNullOrBlank()) {
+                            qp["root"] = rootFixed0
+                        }
+                        val newUrl = base + "?" + qp.entries.joinToString("&") { (k, v) -> "$k=$v" }
+
+                        val builderObj = try { XposedHelpers.callMethod(reqObj, "m22172f") } catch (_: Throwable) { null } ?: return
+                        val builderClazz = builderObj.javaClass
+                        val setUrlMethod = builderClazz.declaredMethods.firstOrNull { m ->
+                            m.parameterTypes.size == 1 && m.parameterTypes[0] == String::class.java && m.returnType == builderClazz
+                        }
+                        val addHeaderMethod = builderClazz.declaredMethods.firstOrNull { m ->
+                            m.parameterTypes.size == 2 &&
+                                m.parameterTypes[0] == String::class.java &&
+                                m.parameterTypes[1] == String::class.java &&
+                                (m.returnType == Void.TYPE || m.returnType == builderClazz)
+                        }
+                        val buildMethod = builderClazz.declaredMethods.firstOrNull { m ->
+                            m.parameterTypes.isEmpty() && m.returnType == reqObj.javaClass
+                        }
+                        if (setUrlMethod != null && buildMethod != null) {
+                            setUrlMethod.isAccessible = true
+                            if (addHeaderMethod != null) addHeaderMethod.isAccessible = true
+                            buildMethod.isAccessible = true
+                            setUrlMethod.invoke(builderObj, newUrl)
+                            try {
+                                if (addHeaderMethod != null) {
+                                    addHeaderMethod.invoke(builderObj, "Accept", "application/json")
+                                    addHeaderMethod.invoke(builderObj, "User-Agent", DESKTOP_UA)
+                                    addHeaderMethod.invoke(builderObj, "Referer", DESKTOP_REFERER)
+                                    addHeaderMethod.invoke(builderObj, "Origin", "https://www.bilibili.com")
+                                }
+                            } catch (_: Throwable) {
+                            }
+                            val rebuiltReq = buildMethod.invoke(builderObj) ?: return
+
+                            var replaced = false
+                            try {
+                                val f = callObj.javaClass.getDeclaredField("f19632c")
+                                f.isAccessible = true
+                                f.set(callObj, rebuiltReq)
+                                replaced = true
+                            } catch (_: Throwable) {
+                            }
+                            if (!replaced) {
+                                try {
+                                    for (f in callObj.javaClass.declaredFields) {
+                                        try {
+                                            if (java.lang.reflect.Modifier.isStatic(f.modifiers)) continue
+                                            f.isAccessible = true
+                                            val v = f.get(callObj) ?: continue
+                                            if (v.javaClass == reqObj.javaClass || v.javaClass.name.endsWith(".elp")) {
+                                                f.set(callObj, rebuiltReq)
+                                                replaced = true
+                                                break
+                                            }
+                                        } catch (_: Throwable) {
+                                        }
+                                    }
+                                } catch (_: Throwable) {
+                                }
+                            }
+
+                            if (replaced) {
+                                XposedBridge.log(
+                                    "RecBiliOld: rewrite bundled reply/reply oid=$oidRaw0 -> $oidFixed" +
+                                        (if (!rootFixed0.isNullOrBlank() && root0.isNullOrBlank()) " (inject root=$rootFixed0)" else "")
+                                )
+                            }
+                        }
+                    }
+                }
+                return
+            }
+        } catch (_: Throwable) {
+        }
 
         val query = try {
             java.net.URI(url).rawQuery.orEmpty()
@@ -3082,11 +3634,49 @@ class XposedInit : IXposedHookLoadPackage {
         val pn = getParam("pn") ?: "1"
         if (pn != "1") return
 
-        val oid = getParam("oid")?.takeIf { it.isNotBlank() } ?: return
+        val oidRaw = getParam("oid")?.takeIf { it.isNotBlank() } ?: return
         val type = getParam("type")?.takeIf { it.isNotBlank() } ?: return
         val ps = getParam("ps")?.takeIf { it.isNotBlank() }
         val sort = getParam("sort")
         val nohot = getParam("nohot")
+
+        val oid = run {
+            // 1) If the app truncated an oversized aid into low32, restore full 64-bit aid based on view request cache.
+            try {
+                val restored = PlayurlFixer.resolveFullAidByLow32(oidRaw)
+                if (!restored.isNullOrBlank() && restored != oidRaw) {
+                    XposedBridge.log("RecBiliOld: restore truncated oid=$oidRaw -> fullAid=$restored")
+                    return@run restored
+                }
+            } catch (_: Throwable) {
+            }
+
+            // 1.5) If we have a recent full 64-bit aid from card click, prefer it.
+            try {
+                val clicked = PlayurlFixer.getLastClickedAid()
+                if (!clicked.isNullOrBlank()) {
+                    val c = clicked.toLongOrNull()
+                    // Only use as fallback when current oid looks like a 32-bit value.
+                    val n = oidRaw.toLongOrNull()
+                    if (c != null && c > Int.MAX_VALUE.toLong() && n != null && n in 1..0xFFFF_FFFFL) {
+                        XposedBridge.log("RecBiliOld: fallback oid via lastClickedAid oid=$oidRaw -> $clicked")
+                        return@run clicked
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+
+            // 2) Legacy client may overflow 32-bit oid into a negative signed int.
+            val n = oidRaw.toLongOrNull()
+            if (n != null && n < 0) {
+                // Convert to unsigned 32-bit string to make server accept it.
+                val fixed = (n and 0xFFFF_FFFFL)
+                XposedBridge.log("RecBiliOld: normalize negative oid=$oidRaw -> $fixed")
+                fixed.toString()
+            } else {
+                oidRaw
+            }
+        }
 
         val mode = when (sort) {
             "0", null -> "2"
@@ -3123,6 +3713,13 @@ class XposedInit : IXposedHookLoadPackage {
                 m.returnType == builderClazz
         }
 
+        val addHeaderMethod = builderClazz.declaredMethods.firstOrNull { m ->
+            m.parameterTypes.size == 2 &&
+                m.parameterTypes[0] == String::class.java &&
+                m.parameterTypes[1] == String::class.java &&
+                (m.returnType == Void.TYPE || m.returnType == builderClazz)
+        }
+
         val buildMethod = builderClazz.declaredMethods.firstOrNull { m ->
             m.parameterTypes.isEmpty() && m.returnType == reqObj.javaClass
         }
@@ -3134,9 +3731,22 @@ class XposedInit : IXposedHookLoadPackage {
         }
 
         setUrlMethod.isAccessible = true
+        if (addHeaderMethod != null) addHeaderMethod.isAccessible = true
         buildMethod.isAccessible = true
 
         setUrlMethod.invoke(builderObj, newUrl)
+
+        // Inject minimal headers required by newer comment endpoints (and generally helps anti-abuse).
+        try {
+            if (addHeaderMethod != null) {
+                addHeaderMethod.invoke(builderObj, "Accept", "application/json")
+                addHeaderMethod.invoke(builderObj, "User-Agent", DESKTOP_UA)
+                addHeaderMethod.invoke(builderObj, "Referer", DESKTOP_REFERER)
+                addHeaderMethod.invoke(builderObj, "Origin", "https://www.bilibili.com")
+            }
+        } catch (_: Throwable) {
+        }
+
         val rebuiltReq = buildMethod.invoke(builderObj) ?: return
 
         var replaced = false
@@ -3178,6 +3788,438 @@ class XposedInit : IXposedHookLoadPackage {
         return params.entries.joinToString("&") { (k, v) ->
             "${percentEncodeForWbi(k)}=${percentEncodeForWbi(v)}"
         }
+    }
+
+    private fun parseQueryParam(url: String, name: String): String? {
+        return try {
+            val query = try {
+                java.net.URI(url).rawQuery.orEmpty()
+            } catch (_: Throwable) {
+                url.substringAfter('?', "")
+            }
+            for (p in query.split('&')) {
+                if (p.isBlank()) continue
+                val idx = p.indexOf('=')
+                val k = if (idx >= 0) p.substring(0, idx) else p
+                if (!k.equals(name, ignoreCase = true)) continue
+                return if (idx >= 0) p.substring(idx + 1) else ""
+            }
+            null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private val bundledCommentPatchedOnce = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
+    private fun tryPatchBundledCommentResponseBodyIfNeeded(responseObj: Any, url: String, bodyStr: String): String? {
+        try {
+            if (!url.contains("/x/v2/reply", ignoreCase = true)) return null
+            if (!bodyStr.trimStart().startsWith("{")) return null
+
+            val root = JSONObject.parseObject(bodyStr) ?: return null
+
+            // Nested replies (楼中楼): /x/v2/reply/reply
+            // This endpoint often returns -400 when oid is a signed32 overflow/truncated value.
+            // Rescue by re-fetching the same legacy endpoint with corrected oid and replace body.
+            try {
+                if (url.contains("/x/v2/reply/reply", ignoreCase = true)) {
+                    val code0 = root.getIntValue("code")
+                    val msg0 = try { root.getString("message") } catch (_: Throwable) { null }
+                    val shouldRescue = code0 == -404 || code0 == -400 || (code0 != 0 && (msg0?.contains("啥都木有") == true || msg0?.contains("请求错误") == true))
+                    if (shouldRescue) {
+                        val oidRaw = parseQueryParam(url, "oid")
+                        val type = parseQueryParam(url, "type")
+                        val rootRpid = parseQueryParam(url, "root")
+                        val pn = parseQueryParam(url, "pn")
+                        val ps = parseQueryParam(url, "ps")
+
+                        val rootRpidFixed = run {
+                            val r0 = rootRpid?.takeIf { it.isNotBlank() }
+                                ?: try { PlayurlFixer.getLastCommentContextRpid() } catch (_: Throwable) { null }
+                            if (r0.isNullOrBlank()) return@run null
+                            val rn = r0.toLongOrNull()
+                            if (rn != null && rn < 0) (rn and 0xFFFF_FFFFL).toString() else r0
+                        }
+
+                        if (!oidRaw.isNullOrBlank() && !type.isNullOrBlank() && !rootRpidFixed.isNullOrBlank()) {
+                            val rescueKey = "rescue-r2r-fetch:oid=$oidRaw&type=$type&root=$rootRpid&pn=${pn ?: ""}&ps=${ps ?: ""}"
+                            if (!bundledCommentPatchedOnce.add(rescueKey)) {
+                                return null
+                            }
+
+                            val oid = run {
+                                try {
+                                    val normalizedForLookup = run {
+                                        val n0 = oidRaw.toLongOrNull()
+                                        if (n0 != null && n0 < 0) (n0 and 0xFFFF_FFFFL).toString() else oidRaw
+                                    }
+                                    val restored = PlayurlFixer.resolveFullAidByLow32(normalizedForLookup)
+                                    if (!restored.isNullOrBlank() && restored != oidRaw) {
+                                        return@run restored
+                                    }
+                                } catch (_: Throwable) {
+                                }
+
+                                try {
+                                    val clicked = PlayurlFixer.getLastClickedAid()
+                                    if (!clicked.isNullOrBlank()) return@run clicked
+                                } catch (_: Throwable) {
+                                }
+
+                                val n = oidRaw.toLongOrNull()
+                                if (n != null && n < 0) (n and 0xFFFF_FFFFL).toString() else oidRaw
+                            }
+
+                            try {
+                                if (bundledCommentPatchedOnce.add("rescue-r2r-attempt:" + url)) {
+                                    XposedBridge.log(
+                                        "RecBiliOld: try rescue bundled reply/reply code=$code0 msg=${msg0 ?: "<null>"} oidRaw=$oidRaw -> oid=$oid type=$type root=$rootRpid url=${url.take(220)}"
+                                    )
+                                }
+                            } catch (_: Throwable) {
+                            }
+
+                            val (http, fetched) = try {
+                                PlayurlFixer.fetchReplyReplyLegacy(
+                                    oid = oid,
+                                    root = rootRpidFixed,
+                                    type = type,
+                                    pn = pn,
+                                    ps = ps,
+                                )
+                            } catch (_: Throwable) {
+                                0 to ""
+                            }
+
+                            if (http in 200..299 && fetched.isNotBlank()) {
+                                val fetchedRoot = try { JSONObject.parseObject(fetched) } catch (_: Throwable) { null }
+                                if (fetchedRoot != null && fetchedRoot.getIntValue("code") == 0) {
+                                    // Some builds treat null list fields as fatal (addAll(null) -> NPE).
+                                    // Ensure list-like fields exist as arrays.
+                                    try {
+                                        val d = fetchedRoot.getJSONObject("data")
+                                        if (d != null) {
+                                            if (!d.containsKey("replies") || d.get("replies") == null) {
+                                                d["replies"] = JSONObject.parseArray("[]")
+                                            }
+                                            val rootObj = d.getJSONObject("root")
+                                            if (rootObj != null && (!rootObj.containsKey("replies") || rootObj.get("replies") == null)) {
+                                                rootObj["replies"] = JSONObject.parseArray("[]")
+                                            }
+                                        }
+                                    } catch (_: Throwable) {
+                                    }
+                                    if (bundledCommentPatchedOnce.add("rescue-r2r:" + url)) {
+                                        XposedBridge.log("RecBiliOld: rescued bundled reply/reply oid=$oid type=$type root=$rootRpid")
+                                    }
+                                    val out = fetchedRoot.toJSONString()
+                                    return patchReplyReplyListFields(out)
+                                }
+
+                                try {
+                                    if (bundledCommentPatchedOnce.add("rescue-r2r-failed:code:" + url)) {
+                                        val fc = try { fetchedRoot?.getIntValue("code") } catch (_: Throwable) { null }
+                                        val fm = try { fetchedRoot?.getString("message") } catch (_: Throwable) { null }
+                                        XposedBridge.log(
+                                            "RecBiliOld: rescue reply/reply fetched but not ok http=$http code=${fc ?: "?"} msg=${fm ?: "<null>"} body=${fetched.take(200)}"
+                                        )
+                                    }
+                                } catch (_: Throwable) {
+                                }
+                            } else {
+                                try {
+                                    if (bundledCommentPatchedOnce.add("rescue-r2r-http-failed:" + url)) {
+                                        XposedBridge.log("RecBiliOld: rescue reply/reply http failed http=$http body=${fetched.take(200)}")
+                                    }
+                                } catch (_: Throwable) {
+                                }
+                            }
+                        }
+                    }
+
+                    // For /x/v2/reply/reply, do not apply the wbi/main -> legacy conversion below.
+                    return null
+                }
+            } catch (_: Throwable) {
+            }
+
+            // Response-stage rescue: legacy /x/v2/reply may return -404/-400 for truncated/overflow oid.
+            // If request-stage rewrite was missed, fetch wbi/main here and replace body.
+            try {
+                val code0 = root.getIntValue("code")
+                val msg0 = try { root.getString("message") } catch (_: Throwable) { null }
+                val shouldRescue = code0 == -404 || code0 == -400 || (code0 != 0 && (msg0?.contains("啥都木有") == true || msg0?.contains("请求错误") == true))
+                if (shouldRescue) {
+                    val oidRaw = parseQueryParam(url, "oid")
+                    val type = parseQueryParam(url, "type")
+                    val ps = parseQueryParam(url, "ps")
+                    val sort = parseQueryParam(url, "sort")
+                    val nohot = parseQueryParam(url, "nohot")
+                    val pn = parseQueryParam(url, "pn")
+
+                    if (!oidRaw.isNullOrBlank() && !type.isNullOrBlank()) {
+                        // Load-more uses legacy /x/v2/reply with pn>1. wbi/main uses cursor pagination and is not compatible.
+                        // For pn>1, rescue by re-fetching the same legacy endpoint with corrected oid.
+                        if (!pn.isNullOrBlank() && pn != "1") {
+                            val rescueKey = "rescue-reply-legacy:oid=$oidRaw&type=$type&pn=$pn&ps=${ps ?: ""}&sort=${sort ?: ""}&nohot=${nohot ?: ""}"
+                            if (!bundledCommentPatchedOnce.add(rescueKey)) {
+                                return null
+                            }
+
+                            val oid = run {
+                                try {
+                                    val normalizedForLookup = run {
+                                        val n0 = oidRaw.toLongOrNull()
+                                        if (n0 != null && n0 < 0) (n0 and 0xFFFF_FFFFL).toString() else oidRaw
+                                    }
+                                    val restored = PlayurlFixer.resolveFullAidByLow32(normalizedForLookup)
+                                    if (!restored.isNullOrBlank() && restored != oidRaw) {
+                                        return@run restored
+                                    }
+                                } catch (_: Throwable) {
+                                }
+                                try {
+                                    val clicked = PlayurlFixer.getLastClickedAid()
+                                    if (!clicked.isNullOrBlank()) return@run clicked
+                                } catch (_: Throwable) {
+                                }
+                                val n = oidRaw.toLongOrNull()
+                                if (n != null && n < 0) (n and 0xFFFF_FFFFL).toString() else oidRaw
+                            }
+
+                            try {
+                                if (bundledCommentPatchedOnce.add("rescue-reply-legacy-attempt:" + url)) {
+                                    XposedBridge.log(
+                                        "RecBiliOld: try rescue legacy /x/v2/reply pn=$pn code=$code0 msg=${msg0 ?: "<null>"} oidRaw=$oidRaw -> oid=$oid type=$type url=${url.take(220)}"
+                                    )
+                                }
+                            } catch (_: Throwable) {
+                            }
+
+                            val (http, fetched) = try {
+                                PlayurlFixer.fetchReplyLegacyMainList(
+                                    oid = oid,
+                                    type = type,
+                                    pn = pn,
+                                    ps = ps,
+                                    sort = sort,
+                                    nohot = nohot,
+                                )
+                            } catch (_: Throwable) {
+                                0 to ""
+                            }
+
+                            if (http in 200..299 && fetched.isNotBlank()) {
+                                val fetchedRoot = try { JSONObject.parseObject(fetched) } catch (_: Throwable) { null }
+                                if (fetchedRoot != null && fetchedRoot.getIntValue("code") == 0) {
+                                    if (bundledCommentPatchedOnce.add("rescue-reply-legacy:" + url)) {
+                                        XposedBridge.log("RecBiliOld: rescued legacy /x/v2/reply pn=$pn oid=$oid type=$type")
+                                    }
+                                    return patchReplyMainListFields(fetchedRoot.toJSONString())
+                                }
+                            }
+
+                            // Fall through to wbi/main rescue only when pn==1.
+                            return null
+                        }
+
+                        val mode = when (sort) {
+                            "0", null -> "2"
+                            else -> "3"
+                        }
+
+                        // Avoid repeated rescue fetches for the same comment request.
+                        val rescueKey = "rescue-fetch:oid=$oidRaw&type=$type&mode=$mode&ps=${ps ?: ""}&nohot=${nohot ?: ""}"
+                        if (!bundledCommentPatchedOnce.add(rescueKey)) {
+                            return null
+                        }
+
+                        val oid = run {
+                            try {
+                                val normalizedForLookup = run {
+                                    val n0 = oidRaw.toLongOrNull()
+                                    if (n0 != null && n0 < 0) (n0 and 0xFFFF_FFFFL).toString() else oidRaw
+                                }
+                                val restored = PlayurlFixer.resolveFullAidByLow32(normalizedForLookup)
+                                if (!restored.isNullOrBlank() && restored != oidRaw) {
+                                    return@run restored
+                                }
+                            } catch (_: Throwable) {
+                            }
+                            try {
+                                val clicked = PlayurlFixer.getLastClickedAid()
+                                if (!clicked.isNullOrBlank()) return@run clicked
+                            } catch (_: Throwable) {
+                            }
+                            val n = oidRaw.toLongOrNull()
+                            if (n != null && n < 0) (n and 0xFFFF_FFFFL).toString() else oidRaw
+                        }
+
+                        try {
+                            if (bundledCommentPatchedOnce.add("rescue-attempt:" + url)) {
+                                XposedBridge.log(
+                                    "RecBiliOld: try rescue bundled comment code=$code0 msg=${msg0 ?: "<null>"} oidRaw=$oidRaw -> oid=$oid type=$type mode=$mode url=${url.take(220)}"
+                                )
+                            }
+                        } catch (_: Throwable) {
+                        }
+
+                        val (http, fetched) = try {
+                            PlayurlFixer.fetchCommentWbiMain(
+                                oid = oid,
+                                type = type,
+                                mode = mode,
+                                ps = ps,
+                                nohot = nohot,
+                            )
+                        } catch (_: Throwable) {
+                            0 to ""
+                        }
+
+                        if (http in 200..299 && fetched.isNotBlank()) {
+                            val fetchedRoot = try { JSONObject.parseObject(fetched) } catch (_: Throwable) { null }
+                            if (fetchedRoot != null && fetchedRoot.getIntValue("code") == 0) {
+                                // Convert wbi/main json into legacy reply shape (page/top/cursor removal)
+                                val d = fetchedRoot.getJSONObject("data")
+                                if (d != null && d.containsKey("cursor")) {
+                                    val cursor = d.getJSONObject("cursor")
+                                    val pn1 = parseQueryParam(url, "pn")?.toIntOrNull() ?: 1
+                                    val ps1 = ps?.toIntOrNull() ?: 20
+                                    val allCount = try { cursor?.getLongValue("all_count") } catch (_: Throwable) { 0L }
+                                    val pageObj = JSONObject()
+                                    pageObj["num"] = pn1
+                                    pageObj["size"] = ps1
+                                    pageObj["count"] = allCount
+                                    pageObj["acount"] = allCount
+                                    d["page"] = pageObj
+                                    d["top"] = null
+                                    d.remove("cursor")
+                                }
+                                if (bundledCommentPatchedOnce.add("rescue:" + url)) {
+                                    XposedBridge.log("RecBiliOld: rescued bundled comment via wbi/main oid=$oid type=$type mode=$mode")
+                                }
+                                return fetchedRoot.toJSONString()
+                            }
+
+                            try {
+                                if (bundledCommentPatchedOnce.add("rescue-failed:code:" + url)) {
+                                    val fc = try { fetchedRoot?.getIntValue("code") } catch (_: Throwable) { null }
+                                    val fm = try { fetchedRoot?.getString("message") } catch (_: Throwable) { null }
+                                    XposedBridge.log(
+                                        "RecBiliOld: rescue fetched but not ok http=$http code=${fc ?: "?"} msg=${fm ?: "<null>"} body=${fetched.take(200)}"
+                                    )
+                                }
+                            } catch (_: Throwable) {
+                            }
+                        } else {
+                            try {
+                                if (bundledCommentPatchedOnce.add("rescue-http-failed:" + url)) {
+                                    XposedBridge.log("RecBiliOld: rescue http failed http=$http body=${fetched.take(200)}")
+                                }
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+
+            val data = root.getJSONObject("data") ?: return null
+
+            // Only patch if it looks like the new lazy-load shape.
+            if (!data.containsKey("cursor")) return null
+
+            val cursor = data.getJSONObject("cursor")
+
+            val pn = parseQueryParam(url, "pn")?.toIntOrNull() ?: 1
+            val ps = parseQueryParam(url, "ps")?.toIntOrNull() ?: 20
+            val allCount = try { cursor?.getLongValue("all_count") } catch (_: Throwable) { 0L }
+
+            val pageObj = JSONObject()
+            pageObj["num"] = pn
+            pageObj["size"] = ps
+            pageObj["count"] = allCount
+            pageObj["acount"] = allCount
+
+            // Make response compatible with old model tv.danmaku.bili.ui.comment.api.BiliCommentList
+            data["page"] = pageObj
+            data["top"] = null
+            data.remove("cursor")
+
+            val patched = root.toJSONString()
+
+            // Logging (only once per unique url to avoid spam)
+            try {
+                if (bundledCommentPatchedOnce.add(url)) {
+                    val (code, msg) = getBundledElrCodeMessage(responseObj)
+                    XposedBridge.log(
+                        "RecBiliOld: patch bundled comment response (wbi/main -> legacy) http=${code ?: "?"} msg=${msg ?: "<null>"} url=${url.take(220)}"
+                    )
+                }
+            } catch (_: Throwable) {
+            }
+
+            return patched
+        } catch (_: Throwable) {
+            return null
+        }
+    }
+
+    private fun patchReplyMainListFields(json: String): String {
+        // Ensure list fields are never null for old models (BiliCommentList.mList / mHotList).
+        var s = json
+        try {
+            s = s.replace("\"replies\":null", "\"replies\":[]")
+            s = s.replace("\"hots\":null", "\"hots\":[]")
+
+            val dataPos = s.indexOf("\"data\":{")
+            if (dataPos >= 0) {
+                val insertAt = dataPos + "\"data\":{".length
+                val dataHead = s.substring(insertAt, minOf(s.length, insertAt + 300))
+                val hasReplies = dataHead.contains("\"replies\"")
+                val hasHots = dataHead.contains("\"hots\"")
+                if (!hasReplies || !hasHots) {
+                    val sb = StringBuilder(s.length + 64)
+                    sb.append(s, 0, insertAt)
+                    if (!hasReplies) sb.append("\"replies\":[],")
+                    if (!hasHots) sb.append("\"hots\":[],")
+                    sb.append(s.substring(insertAt))
+                    s = sb.toString()
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return s
+    }
+
+    private fun patchReplyReplyListFields(json: String): String {
+        // Ensure list fields are never null for old models (BiliCommentList.mList / mHotList).
+        var s = json
+        try {
+            // Normalize explicit nulls first.
+            s = s.replace("\"replies\":null", "\"replies\":[]")
+            s = s.replace("\"hots\":null", "\"hots\":[]")
+
+            // If replies/hots missing under data, inject empty arrays.
+            val dataPos = s.indexOf("\"data\":{")
+            if (dataPos >= 0) {
+                val insertAt = dataPos + "\"data\":{".length
+                val dataHead = s.substring(insertAt, minOf(s.length, insertAt + 300))
+                val hasReplies = dataHead.contains("\"replies\"")
+                val hasHots = dataHead.contains("\"hots\"")
+                if (!hasReplies || !hasHots) {
+                    val sb = StringBuilder(s.length + 64)
+                    sb.append(s, 0, insertAt)
+                    if (!hasReplies) sb.append("\"replies\":[],")
+                    if (!hasHots) sb.append("\"hots\":[],")
+                    sb.append(s.substring(insertAt))
+                    s = sb.toString()
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return s
     }
 
     private fun percentEncodeForWbi(s: String): String {
@@ -3343,6 +4385,17 @@ class XposedInit : IXposedHookLoadPackage {
                 }
             }
 
+            // Extra diagnostics for comment endpoints. These often go through bundled okhttp (bl.elr).
+            try {
+                if (!url.isNullOrBlank() && url.contains("/x/v2/reply", ignoreCase = true)) {
+                    val (code, msg) = getBundledElrCodeMessage(responseObj)
+                    XposedBridge.log(
+                        "RecBiliOld: [bundled-comment] http=${code ?: "?"} msg=${msg ?: "<null>"} url=${url.take(220)}"
+                    )
+                }
+            } catch (_: Throwable) {
+            }
+
             try {
                 val cls = responseObj.javaClass.name
                 val sb = StringBuilder()
@@ -3396,7 +4449,8 @@ class XposedInit : IXposedHookLoadPackage {
             if (url == null) return replacement
             val shouldTryBody = isViewUrl(url) ||
                 url.contains("/x/player/wbi/playurl", ignoreCase = true) ||
-                url.contains("/x/web-interface/view", ignoreCase = true)
+                url.contains("/x/web-interface/view", ignoreCase = true) ||
+                url.contains("/x/v2/reply", ignoreCase = true)
             if (!shouldTryBody) return replacement
 
             // 1) use cached body if we've already extracted this response once.
@@ -3502,6 +4556,38 @@ class XposedInit : IXposedHookLoadPackage {
             } catch (_: Throwable) {
             }
 
+            // Always ingest possible full 64-bit aids from list-style responses before any rewriting.
+            try {
+                PlayurlFixer.ingestAidMappingsFromListJson(url, bodyStr!!)
+            } catch (_: Throwable) {
+            }
+
+            // Patch comment JSON for old client if needed.
+            try {
+                if (url.contains("/x/v2/reply", ignoreCase = true)) {
+                    val patchedComment = tryPatchBundledCommentResponseBodyIfNeeded(responseObj, url, bodyStr!!)
+                    if (!patchedComment.isNullOrBlank()) {
+                        if (patchBundledResponseBody(responseObj, patchedComment)) {
+                            bodyStr = patchedComment
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+
+            // Patch list-style responses (rank/feed/etc.) that carry oversized avid in `param`.
+            // Old client code frequently does Integer.parseInt(param), which turns oversized avid into 0.
+            // We rewrite `param` to signed-32 while keeping `uri` intact; full aid is restored later via mapping.
+            try {
+                val patchedList = tryPatchBundledListParamAvidIfNeeded(url, bodyStr!!)
+                if (!patchedList.isNullOrBlank()) {
+                    if (patchBundledResponseBody(responseObj, patchedList)) {
+                        bodyStr = patchedList
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+
             try {
                 bundledRespBodyCache[responseObj] = bodyStr!!
             } catch (_: Throwable) {
@@ -3523,6 +4609,11 @@ class XposedInit : IXposedHookLoadPackage {
 
             val snippet = bodyStr!!.take(3000)
             XposedBridge.log("RecBiliOld: [bundled-body] url=$url body=$snippet")
+            try {
+                // Populate low32->fullAid mapping from list-style responses (rank/feed/etc.)
+                PlayurlFixer.ingestAidMappingsFromListJson(url, bodyStr!!)
+            } catch (_: Throwable) {
+            }
             if (isViewUrl(url)) {
                 PlayurlFixer.ingestVideoViewResponse(url, bodyStr!!)
             }
@@ -3549,6 +4640,44 @@ class XposedInit : IXposedHookLoadPackage {
             if (s.length in 3..8 && s.all { it.isLetter() }) s else null
         } catch (_: Throwable) {
             null
+        }
+    }
+
+    private fun tryPatchBundledListParamAvidIfNeeded(url: String, body: String): String? {
+        try {
+            val t = body.trimStart()
+            if (!t.startsWith("{")) return null
+            if (!t.contains("\"param\"")) return null
+
+            val root = JSONObject.parseObject(t) ?: return null
+            if (root.getIntValue("code") != 0) return null
+
+            val dataArr = root.getJSONArray("data") ?: return null
+            if (dataArr.isEmpty) return null
+
+            var changed = false
+            for (i in 0 until dataArr.size) {
+                val it = dataArr.getJSONObject(i) ?: continue
+                val param = it.getString("param")?.trim()
+                if (param.isNullOrBlank()) continue
+                if (!param.all { ch -> ch.isDigit() }) continue
+
+                val aidLong = param.toLongOrNull() ?: continue
+                if (aidLong <= 0L) continue
+
+                if (aidLong > Int.MAX_VALUE.toLong()) {
+                    val signed32 = (aidLong and 0xFFFF_FFFFL).toInt().toString()
+                    if (signed32 != param) {
+                        it["param"] = signed32
+                        changed = true
+                    }
+                }
+            }
+
+            if (!changed) return null
+            return root.toJSONString()
+        } catch (_: Throwable) {
+            return null
         }
     }
 
@@ -3731,9 +4860,10 @@ class XposedInit : IXposedHookLoadPackage {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
                             val resp = param.result ?: return
-                            val patched = tryPatchOkHttpResponseBodyIfView(resp)
-                            val out = patched ?: resp
-                            if (patched != null) {
+                            val patchedView = tryPatchOkHttpResponseBodyIfView(resp)
+                            val patchedComment = tryPatchOkHttpResponseBodyIfComment(patchedView ?: resp)
+                            val out = patchedComment ?: patchedView ?: resp
+                            if (out !== resp) {
                                 param.result = out
                             }
                             ingestOkHttpResponse(out)
@@ -3764,9 +4894,12 @@ class XposedInit : IXposedHookLoadPackage {
                                         if (method.name == "onResponse" && args != null && args.size >= 2) {
                                             val resp = args[1]
                                             if (resp != null) {
-                                                val patched = tryPatchOkHttpResponseBodyIfView(resp)
-                                                if (patched != null) {
-                                                    args[1] = patched
+                                                val patchedView = tryPatchOkHttpResponseBodyIfView(resp)
+                                                val patchedComment = tryPatchOkHttpResponseBodyIfComment(patchedView ?: resp)
+                                                if (patchedComment != null) {
+                                                    args[1] = patchedComment
+                                                } else if (patchedView != null) {
+                                                    args[1] = patchedView
                                                 }
                                                 ingestOkHttpResponse(args[1]!!)
                                             }

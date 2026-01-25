@@ -21,6 +21,13 @@ object PlayurlFixer {
         var responseBytes: ByteArray? = null,
     )
 
+    private data class CommentContext(
+        val oid: String?,
+        val rpid: String?,
+        val type: String?,
+        val ts: Long,
+    )
+
     private data class DurlInfo(
         val url: String,
         val timelength: Long?,
@@ -31,6 +38,22 @@ object PlayurlFixer {
     private val interceptMap = WeakHashMap<Any, InterceptInfo>()
 
     private val aidOverrideMap = WeakHashMap<Any, String>()
+
+    private val low32AidToFullAid: MutableMap<Long, String> = Collections.synchronizedMap(object : LinkedHashMap<Long, String>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, String>?): Boolean {
+            return size > 800
+        }
+    })
+
+    private fun putLow32AidMapping(fullAid: String) {
+        try {
+            val a = fullAid.toLongOrNull() ?: return
+            if (a <= 0L) return
+            val key = (a and 0xFFFF_FFFFL)
+            low32AidToFullAid[key] = a.toString()
+        } catch (_: Throwable) {
+        }
+    }
 
     private data class AidBvid(val aid: String?, val bvid: String?)
 
@@ -71,11 +94,44 @@ object PlayurlFixer {
         }
     }
 
+    fun setLastCommentContext(oid: String?, rpid: String?, type: String?) {
+        try {
+            val o = oid?.trim()?.takeIf { it.isNotBlank() }
+            val r = rpid?.trim()?.takeIf { it.isNotBlank() }
+            val t = type?.trim()?.takeIf { it.isNotBlank() }
+            if (o == null && r == null && t == null) return
+            lastCommentContextRef.set(CommentContext(o, r, t, System.currentTimeMillis()))
+            // If oid looks like a positive 64-bit aid, also seed mapping.
+            val n = o?.toLongOrNull()
+            if (n != null && n > Int.MAX_VALUE.toLong()) {
+                putLow32AidMapping(n.toString())
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun getLastCommentContextOid(): String? {
+        return try { lastCommentContextRef.get()?.oid } catch (_: Throwable) { null }
+    }
+
+    fun getLastCommentContextRpid(): String? {
+        return try { lastCommentContextRef.get()?.rpid } catch (_: Throwable) { null }
+    }
+
+    fun getLastCommentContextType(): String? {
+        return try { lastCommentContextRef.get()?.type } catch (_: Throwable) { null }
+    }
+
     @Volatile
     private var lastViewAidOrBvid: AidBvid? = null
 
     @Volatile
+    private var lastClickedAid: String? = null
+
+    @Volatile
     private var appContext: android.content.Context? = null
+
+    private val lastCommentContextRef = AtomicReference<CommentContext?>()
 
     fun isVerboseNetworkEnabled(): Boolean {
         return try {
@@ -99,6 +155,41 @@ object PlayurlFixer {
     fun setAppContext(ctx: android.content.Context?) {
         if (ctx == null) return
         appContext = ctx.applicationContext ?: ctx
+    }
+
+    fun setLastClickedAid(aid: String?) {
+        val v = aid?.trim()?.takeIf { it.isNotBlank() } ?: return
+        val n = v.toLongOrNull() ?: return
+        if (n <= 0L) return
+        lastClickedAid = n.toString()
+        putLow32AidMapping(lastClickedAid!!)
+        try {
+            val ctx = appContext ?: return
+            val mode = try {
+                android.content.Context.MODE_PRIVATE or android.content.Context.MODE_MULTI_PROCESS
+            } catch (_: Throwable) {
+                android.content.Context.MODE_PRIVATE
+            }
+            val sp = ctx.getSharedPreferences("recbiliold_cache", mode)
+            sp.edit().putString("last_clicked_aid", lastClickedAid).commit()
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun getLastClickedAid(): String? {
+        lastClickedAid?.let { return it }
+        return try {
+            val ctx = appContext ?: return null
+            val mode = try {
+                android.content.Context.MODE_PRIVATE or android.content.Context.MODE_MULTI_PROCESS
+            } catch (_: Throwable) {
+                android.content.Context.MODE_PRIVATE
+            }
+            val sp = ctx.getSharedPreferences("recbiliold_cache", mode)
+            sp.getString("last_clicked_aid", null)?.also { lastClickedAid = it }
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     private fun putPersistedAidBvid(aid: String?, bvid: String?) {
@@ -283,6 +374,56 @@ object PlayurlFixer {
         }
     }
 
+    fun ingestAidMappingsFromListJson(url: String, body: String) {
+        try {
+            if (body.isBlank()) return
+            val t = body.trimStart()
+            if (!t.startsWith("{")) return
+            if (!t.contains("\"param\"") && !t.contains("bilibili://video/")) return
+
+            val root = JSONObject(t)
+            if (root.optInt("code", 0) != 0) return
+
+            fun handleUri(s: String?) {
+                if (s.isNullOrBlank()) return
+                val m = Regex("(?i)bilibili://video/(\\d+)").find(s)
+                val aid = m?.groupValues?.getOrNull(1) ?: return
+                putLow32AidMapping(aid)
+            }
+
+            fun handleParam(s: String?) {
+                if (s.isNullOrBlank()) return
+                if (!s.all { it.isDigit() }) return
+                putLow32AidMapping(s)
+            }
+
+            fun visit(obj: Any?) {
+                when (obj) {
+                    is JSONObject -> {
+                        try {
+                            handleParam(obj.optString("param", null))
+                            handleUri(obj.optString("uri", null))
+                        } catch (_: Throwable) {
+                        }
+                        val it = obj.keys()
+                        while (it.hasNext()) {
+                            val k = it.next()
+                            visit(obj.opt(k))
+                        }
+                    }
+                    is JSONArray -> {
+                        for (i in 0 until obj.length()) {
+                            visit(obj.opt(i))
+                        }
+                    }
+                }
+            }
+
+            visit(root)
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun resolveCidToAidBvid(cid: String): AidBvid? {
         if (cid.isBlank()) return null
 
@@ -425,8 +566,30 @@ object PlayurlFixer {
             lastViewAidOrBvid = AidBvid(aid = aid, bvid = bvid)
             XposedBridge.log("RecBiliOld: ingest view params aid=${aid ?: "<null>"} bvid=${bvid ?: "<null>"} url=$url")
             putPersistedAidBvid(aid = aid, bvid = bvid)
+
+            try {
+                val a = aid?.toLongOrNull()
+                if (a != null && a > 0) {
+                    val key = (a and 0xFFFF_FFFFL)
+                    low32AidToFullAid[key] = a.toString()
+                }
+            } catch (_: Throwable) {
+            }
         } catch (t: Throwable) {
             XposedBridge.log(t)
+        }
+    }
+
+    fun resolveFullAidByLow32(oidOrLow32: String?): String? {
+        if (oidOrLow32.isNullOrBlank()) return null
+        return try {
+            val n = oidOrLow32.toLongOrNull() ?: return null
+            // Accept negative values (signed32 overflow). Always normalize to low32 key.
+            val key = (n and 0xFFFF_FFFFL)
+            if (key == 0L) return null
+            low32AidToFullAid[key]
+        } catch (_: Throwable) {
+            null
         }
     }
 
@@ -751,6 +914,94 @@ object PlayurlFixer {
     fun signWbiParams(params: Map<String, String>): Map<String, String> {
         val (imgKey, subKey) = getWbiKeys()
         return encWbi(params, imgKey, subKey)
+    }
+
+    fun fetchCommentWbiMain(
+        oid: String,
+        type: String,
+        mode: String,
+        ps: String?,
+        nohot: String?,
+    ): Pair<Int, String> {
+        val baseParams = LinkedHashMap<String, String>()
+        baseParams["oid"] = oid
+        baseParams["type"] = type
+        baseParams["mode"] = mode
+        if (!ps.isNullOrBlank()) baseParams["ps"] = ps
+        if (!nohot.isNullOrBlank()) baseParams["nohot"] = nohot
+
+        val signed = signWbiParams(baseParams)
+        val url = "https://api.bilibili.com/x/v2/reply/wbi/main?" + signed.entries.joinToString("&") { (k, v) ->
+            percentEncode(k) + "=" + percentEncode(v)
+        }
+
+        val headers = linkedMapOf(
+            "Accept" to "application/json",
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "Referer" to "https://www.bilibili.com/",
+            "Origin" to "https://www.bilibili.com",
+        )
+
+        return httpGetWithCode(url, headers)
+    }
+
+    fun fetchReplyLegacyMainList(
+        oid: String,
+        type: String,
+        pn: String?,
+        ps: String?,
+        sort: String?,
+        nohot: String?,
+    ): Pair<Int, String> {
+        val qp = LinkedHashMap<String, String>()
+        qp["oid"] = oid
+        qp["type"] = type
+        if (!pn.isNullOrBlank()) qp["pn"] = pn
+        if (!ps.isNullOrBlank()) qp["ps"] = ps
+        if (!sort.isNullOrBlank()) qp["sort"] = sort
+        if (!nohot.isNullOrBlank()) qp["nohot"] = nohot
+
+        val url = "https://api.bilibili.com/x/v2/reply?" + qp.entries.joinToString("&") { (k, v) ->
+            percentEncode(k) + "=" + percentEncode(v)
+        }
+
+        val headers = linkedMapOf(
+            "Accept" to "application/json",
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "Referer" to "https://www.bilibili.com/",
+            "Origin" to "https://www.bilibili.com",
+        )
+
+        return httpGetWithCode(url, headers)
+    }
+
+    fun fetchReplyReplyLegacy(
+        oid: String,
+        type: String,
+        root: String,
+        pn: String?,
+        ps: String?,
+    ): Pair<Int, String> {
+        val qp = LinkedHashMap<String, String>()
+        qp["oid"] = oid
+        qp["type"] = type
+        qp["root"] = root
+        if (!pn.isNullOrBlank()) qp["pn"] = pn
+        if (!ps.isNullOrBlank()) qp["ps"] = ps
+        qp["sort"] = "1"
+
+        val url = "https://api.bilibili.com/x/v2/reply/reply?" + qp.entries.joinToString("&") { (k, v) ->
+            percentEncode(k) + "=" + percentEncode(v)
+        }
+
+        val headers = linkedMapOf(
+            "Accept" to "application/json",
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "Referer" to "https://www.bilibili.com/",
+            "Origin" to "https://www.bilibili.com",
+        )
+
+        return httpGetWithCode(url, headers)
     }
 
     private fun encWbi(
