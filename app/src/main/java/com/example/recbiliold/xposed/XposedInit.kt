@@ -39,98 +39,7 @@ class XposedInit : IXposedHookLoadPackage {
     }
 
     private fun hookCommentActivityIntentCaptureIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // Capture CommentActivity extras (oid/rpId/type) to improve fullAid restoration.
-        // The legacy client may pass overflowed signed32 values; caching helps correlation/debug.
-        try {
-            XposedHelpers.findAndHookMethod(
-                android.app.Activity::class.java,
-                "startActivityForResult",
-                android.content.Intent::class.java,
-                Int::class.javaPrimitiveType,
-                android.os.Bundle::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        try {
-                            val intent = param.args.getOrNull(0) as? android.content.Intent ?: return
-                            captureCommentActivityIntentIfAny(intent)
-                        } catch (_: Throwable) {
-                        }
-                    }
-                }
-            )
-        } catch (_: Throwable) {
-        }
-
-        try {
-            XposedHelpers.findAndHookMethod(
-                android.app.Activity::class.java,
-                "startActivityForResult",
-                android.content.Intent::class.java,
-                Int::class.javaPrimitiveType,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        try {
-                            val intent = param.args.getOrNull(0) as? android.content.Intent ?: return
-                            captureCommentActivityIntentIfAny(intent)
-                        } catch (_: Throwable) {
-                        }
-                    }
-                }
-            )
-        } catch (_: Throwable) {
-        }
-
-        try {
-            XposedHelpers.findAndHookMethod(
-                android.app.Activity::class.java,
-                "startActivity",
-                android.content.Intent::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        try {
-                            val intent = param.args.getOrNull(0) as? android.content.Intent ?: return
-                            captureCommentActivityIntentIfAny(intent)
-                        } catch (_: Throwable) {
-                        }
-                    }
-                }
-            )
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun captureCommentActivityIntentIfAny(intent: android.content.Intent) {
-        try {
-            val cn = try { intent.component?.className } catch (_: Throwable) { null }
-            if (cn.isNullOrBlank()) return
-            if (!cn.endsWith("CommentActivity")) return
-
-            val extras = try { intent.extras } catch (_: Throwable) { null } ?: return
-            val oid = try {
-                when {
-                    extras.containsKey("oid") -> extras.get("oid")?.toString()
-                    else -> null
-                }
-            } catch (_: Throwable) { null }
-
-            val rpid = try {
-                when {
-                    extras.containsKey("rpId") -> extras.get("rpId")?.toString()
-                    extras.containsKey("rpid") -> extras.get("rpid")?.toString()
-                    else -> null
-                }
-            } catch (_: Throwable) { null }
-
-            val type = try {
-                when {
-                    extras.containsKey("type") -> extras.get("type")?.toString()
-                    else -> null
-                }
-            } catch (_: Throwable) { null }
-
-            PlayurlFixer.setLastCommentContext(oid = oid, rpid = rpid, type = type)
-        } catch (_: Throwable) {
-        }
+        XposedHooksCommentIntent.hookCommentActivityIntentCaptureIfPresent(lpparam)
     }
 
     private val bundledRespBodyCache = WeakHashMap<Any, String>()
@@ -1895,10 +1804,10 @@ class XposedInit : IXposedHookLoadPackage {
             hookBundledOkHttpViewResponseIfPresent(lpparam)
             hookVolleyViewResponseIfPresent(lpparam)
             hookFeedJumpAvidClampFixIfPresent(lpparam)
-            hookHomeVideoCardAvidFixIfPresent(lpparam)
             hookFatUriVideoOpenFixIfPresent(lpparam)
             hookFatVideoBangumiSanitizerIfPresent(lpparam)
             hookVideoDetailsIntentSanitizerIfPresent(lpparam)
+            hookRankingListAvidFixIfPresent(lpparam)
             hookBundledViewAidPlaceholderRewriteIfPresent(lpparam)
             hookBundledHttpUrlGetterAidRewriteIfPresent(lpparam)
             hookBundledViewAidBuildTimeRewriteIfPresent(lpparam)
@@ -1955,12 +1864,12 @@ class XposedInit : IXposedHookLoadPackage {
                             )
 
                             try {
-                                tryFixVideoDetailsAvidZero(intent)
+                                XposedHooksVideoDetails.tryFixVideoDetailsAvidZero(intent)
                             } catch (t: Throwable) {
                                 XposedBridge.log(t)
                             }
 
-                            val removed = sanitizeVideoDetailsIntent(intent, preferAggressive = fromUpSpace)
+                            val removed = XposedHooksVideoDetails.sanitizeVideoDetailsIntent(intent, preferAggressive = fromUpSpace)
                             if (removed.isNotEmpty()) {
                                 XposedBridge.log("RecBiliOld: fat.m25088a sanitized VideoDetailsActivity removed=${removed.joinToString(prefix = "[", postfix = "]")}")
                             }
@@ -1977,233 +1886,7 @@ class XposedInit : IXposedHookLoadPackage {
     }
 
     private fun hookVideoDetailsIntentSanitizerIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val cl = lpparam.classLoader
-        val actClazz1 = XposedHelpers.findClassIfExists("tv.danmaku.bili.ui.video.VideoDetailsActivity", cl)
-        val actClazz2 = XposedHelpers.findClassIfExists("tv.danmaku.bili.p046ui.video.VideoDetailsActivity", cl)
-        val targets = listOfNotNull(actClazz1, actClazz2)
-        if (targets.isEmpty()) return
-
-        for (actClazz in targets) {
-            try {
-                XposedHelpers.findAndHookMethod(
-                    actClazz,
-                    "onCreate",
-                    android.os.Bundle::class.java,
-                    object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            try {
-                                val act = param.thisObject as? android.app.Activity ?: return
-                                val intent = act.intent ?: return
-
-                                val dataStr = try { intent.data?.toString() } catch (_: Throwable) { null }
-                                val extras = try { intent.extras } catch (_: Throwable) { null }
-                                val keys = try { extras?.keySet()?.toList().orEmpty() } catch (_: Throwable) { emptyList() }
-
-                                XposedBridge.log(
-                                    "RecBiliOld: VideoDetailsActivity.onCreate intent" +
-                                        " data=${dataStr ?: "<null>"}" +
-                                        " extrasKeys=${keys.joinToString(prefix = "[", postfix = "]")}"
-                                )
-
-                                try {
-                                    tryFixVideoDetailsAvidZero(intent)
-                                } catch (t: Throwable) {
-                                    XposedBridge.log(t)
-                                }
-
-                                val removed = sanitizeVideoDetailsIntent(intent, preferAggressive = true)
-                                if (removed.isNotEmpty()) {
-                                    XposedBridge.log("RecBiliOld: VideoDetailsActivity.onCreate sanitized removed=${removed.joinToString(prefix = "[", postfix = "]")}")
-                                }
-                            } catch (t: Throwable) {
-                                XposedBridge.log(t)
-                            }
-                        }
-                    }
-                )
-                XposedBridge.log("RecBiliOld: VideoDetailsActivity intent sanitizer hook installed act=${actClazz.name}")
-            } catch (t: Throwable) {
-                XposedBridge.log(t)
-            }
-        }
-    }
-
-    private fun sanitizeVideoDetailsIntent(intent: android.content.Intent, preferAggressive: Boolean): List<String> {
-        val removed = ArrayList<String>()
-        val extras = try { intent.extras } catch (_: Throwable) { null } ?: return removed
-        val keys = try { extras.keySet()?.toList().orEmpty() } catch (_: Throwable) { emptyList() }
-        if (keys.isEmpty()) return removed
-
-        fun shouldRemove(k: String): Boolean {
-            val s = k.lowercase()
-            if (s.contains("season") || s.contains("episode") || s == "epid" || s == "ep_id" || s == "episode_id") return true
-            if (s.contains("bangumi") || s.contains("pgc") || s.contains("ogv")) return true
-            if (s.contains("movie")) return true
-            if (s.contains("is_bangumi") || s.contains("isbangumi") || s.contains("from_bangumi") || s.contains("frombangumi")) return true
-            if (preferAggressive && (s.contains("spm") || s.contains("track") || s.contains("from"))) return false
-            return false
-        }
-
-        for (k in keys) {
-            try {
-                if (!shouldRemove(k)) continue
-                if (!intent.hasExtra(k)) continue
-                intent.removeExtra(k)
-                removed.add(k)
-            } catch (_: Throwable) {
-            }
-        }
-
-        try {
-            // Some implementations pack nested bundles.
-            val nestedKeys = listOf("bundle", "extra", "extras")
-            for (nk in nestedKeys) {
-                val b = try { extras.get(nk) } catch (_: Throwable) { null }
-                if (b is android.os.Bundle) {
-                    val nks = try { b.keySet()?.toList().orEmpty() } catch (_: Throwable) { emptyList() }
-                    var removedAny = false
-                    for (k in nks) {
-                        if (shouldRemove(k)) {
-                            try {
-                                b.remove(k)
-                                removed.add("$nk.$k")
-                                removedAny = true
-                            } catch (_: Throwable) {
-                            }
-                        }
-                    }
-                    if (removedAny) {
-                        try { intent.putExtra(nk, b) } catch (_: Throwable) { }
-                    }
-                }
-            }
-        } catch (_: Throwable) {
-        }
-
-        return removed
-    }
-
-    private fun tryFixVideoDetailsAvidZero(intent: android.content.Intent) {
-        val extras = try { intent.extras } catch (_: Throwable) { null } ?: return
-
-        fun readLongExtra(key: String): Long? {
-            return try {
-                if (!intent.hasExtra(key)) return null
-                val v = extras.get(key)
-                when (v) {
-                    is Long -> v
-                    is Int -> v.toLong()
-                    is String -> v.toLongOrNull()
-                    else -> null
-                }
-            } catch (_: Throwable) {
-                null
-            }
-        }
-
-        val avid = readLongExtra("avid") ?: readLongExtra("aid") ?: return
-
-        val clickedAid = try { PlayurlFixer.getLastClickedAid() } catch (_: Throwable) { null }
-        val clickedAidLong = clickedAid?.toLongOrNull()
-
-        // If we have a recent full 64-bit aid from card click, and current avid looks invalid/truncated,
-        // force override.
-        if (clickedAidLong != null && clickedAidLong > Int.MAX_VALUE.toLong()) {
-            val looksTruncated = avid == 0L || avid < 0L || avid <= Int.MAX_VALUE.toLong()
-            if (looksTruncated && clickedAidLong.toString() != avid.toString()) {
-                try {
-                    intent.putExtra("avid", clickedAidLong)
-                } catch (_: Throwable) {
-                }
-                try {
-                    intent.putExtra("aid", clickedAidLong)
-                } catch (_: Throwable) {
-                }
-                XposedBridge.log("RecBiliOld: force VideoDetailsActivity avid -> lastClickedAid=$clickedAidLong (was $avid)")
-                return
-            }
-        }
-
-        if (avid != 0L) return
-
-        var fixedAid: Long? = null
-
-        // 1) Try extract from embedded BiliVideo extra if present.
-        try {
-            val v = extras.get("video")
-            if (v != null) {
-                val candidates = arrayOf("aid", "avid", "avId", "av_id", "AID", "AVID")
-                for (name in candidates) {
-                    try {
-                        val f = v.javaClass.declaredFields.firstOrNull { it.name == name }
-                        if (f != null) {
-                            f.isAccessible = true
-                            val fv = f.get(v)
-                            val n = when (fv) {
-                                is Long -> fv
-                                is Int -> fv.toLong()
-                                is String -> fv.toLongOrNull()
-                                else -> null
-                            }
-                            if (n != null && n > 0L) {
-                                fixedAid = n
-                                break
-                            }
-                        }
-                    } catch (_: Throwable) {
-                    }
-                }
-
-                if (fixedAid == null) {
-                    // Try 0-arg getters.
-                    val methods = arrayOf("getAid", "getAvid", "aid", "avid")
-                    for (mn in methods) {
-                        try {
-                            val m = v.javaClass.declaredMethods.firstOrNull { it.name == mn && it.parameterTypes.isEmpty() }
-                            if (m != null) {
-                                m.isAccessible = true
-                                val r = m.invoke(v)
-                                val n = when (r) {
-                                    is Long -> r
-                                    is Int -> r.toLong()
-                                    is String -> r.toLongOrNull()
-                                    else -> null
-                                }
-                                if (n != null && n > 0L) {
-                                    fixedAid = n
-                                    break
-                                }
-                            }
-                        } catch (_: Throwable) {
-                        }
-                    }
-                }
-            }
-        } catch (_: Throwable) {
-        }
-
-        // 2) Fallback: use last persisted aid (if user just came from a view request).
-        if (fixedAid == null) {
-            try {
-                val p = PlayurlFixer.getPersistedAidBvidForJump()
-                val a = p?.first?.toLongOrNull()
-                if (a != null && a > 0L) fixedAid = a
-            } catch (_: Throwable) {
-            }
-        }
-
-        val realAid = fixedAid ?: return
-
-        try {
-            intent.putExtra("avid", realAid)
-        } catch (_: Throwable) {
-        }
-        try {
-            intent.putExtra("aid", realAid)
-        } catch (_: Throwable) {
-        }
-
-        XposedBridge.log("RecBiliOld: fix VideoDetailsActivity avid=0 -> $realAid")
+        XposedHooksVideoDetails.hookVideoDetailsIntentSanitizerIfPresent(lpparam)
     }
 
     private fun hookBundledViewAidBuildTimeRewriteIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -2317,7 +2000,7 @@ class XposedInit : IXposedHookLoadPackage {
                         } catch (_: Throwable) {
                         }
 
-                        val realAid = oversizedAidAtomicRef.get() ?: return
+                        val realAid = XposedSharedState.oversizedAidAtomicRef.get() ?: return
                         if (realAid <= 0L) return
                         if (!urlStr.contains("/x/v2/view", ignoreCase = true)) return
 
@@ -2375,7 +2058,7 @@ class XposedInit : IXposedHookLoadPackage {
                 getUrlMethod,
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        val realAid = oversizedAidAtomicRef.get() ?: return
+                        val realAid = XposedSharedState.oversizedAidAtomicRef.get() ?: return
                         if (realAid <= 0L) return
 
                         val urlObj = param.result ?: return
@@ -2434,7 +2117,7 @@ class XposedInit : IXposedHookLoadPackage {
                 setUrlString,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        val realAid = oversizedAidAtomicRef.get() ?: return
+                        val realAid = XposedSharedState.oversizedAidAtomicRef.get() ?: return
                         if (realAid <= 0L) return
 
                         val url = param.args.getOrNull(0) as? String ?: return
@@ -2494,7 +2177,7 @@ class XposedInit : IXposedHookLoadPackage {
                         val uriObj = param.args.getOrNull(1) ?: return
                         val uriStr = try { uriObj.toString() } catch (_: Throwable) { return }
 
-                        val aidLong = extractAidFromUriStringLong(uriStr) ?: return
+                        val aidLong = XposedHookUtils.extractAidFromUriStringLong(uriStr) ?: return
                         if (aidLong <= 0L) return
 
                         try {
@@ -2519,7 +2202,7 @@ class XposedInit : IXposedHookLoadPackage {
                         }
 
                         // Oversized aid: seed for VideoDetailsActivity oversized hook.
-                        oversizedAidAtomicRef.set(aidLong)
+                        XposedSharedState.oversizedAidAtomicRef.set(aidLong)
                         PlayurlFixer.ingestOversizedAid(aidLong.toString())
                         val key = "fatUriOversizedAvid=$aidLong"
                         if (cardClickLoggedOnce.add(key)) {
@@ -2533,227 +2216,8 @@ class XposedInit : IXposedHookLoadPackage {
             XposedBridge.log(t)
         }
     }
-
-    private fun extractAidFromUriStringLong(uri: String): Long? {
-        try {
-            val q1 = Regex("(?i)(?:[?&])(aid|avid)=(\\d+)").find(uri)
-            if (q1 != null) return q1.groupValues[2].toLongOrNull()
-
-            val q0 = Regex("(?i)bilibili://video/(\\d+)").find(uri)
-            if (q0 != null) return q0.groupValues[1].toLongOrNull()
-
-            val q2 = Regex("(?i)(?:^|/)(?:av)(\\d+)(?:\\b|/|\\?|$)").find(uri)
-            if (q2 != null) return q2.groupValues[1].toLongOrNull()
-
-            val q3 = Regex("(?i)(?:[?&])jump_id=(\\d+)").find(uri)
-            if (q3 != null) return q3.groupValues[1].toLongOrNull()
-        } catch (_: Throwable) {
-        }
-        return null
-    }
-
-    private fun hookHomeVideoCardAvidFixIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val cl = lpparam.classLoader
-        val cardClazz = XposedHelpers.findClassIfExists("tv.danmaku.bili.tianma.promo.cards.VideoCard", cl) ?: return
-        val fatClazz = XposedHelpers.findClassIfExists("p000bl.fat", cl)
-            ?: XposedHelpers.findClassIfExists("bl.fat", cl)
-            ?: return
-
-        val openUriMethod = fatClazz.declaredMethods.firstOrNull { m ->
-            m.name == "m25090a" &&
-                m.parameterTypes.size == 2 &&
-                android.content.Context::class.java.isAssignableFrom(m.parameterTypes[0]) &&
-                m.parameterTypes[1].name == "android.net.Uri"
-        }
-
-        val ridClazz = XposedHelpers.findClassIfExists("com.bilibili.app.blue.R\$id", cl)
-        val moreId = try {
-            if (ridClazz != null) XposedHelpers.getStaticIntField(ridClazz, "more") else 0
-        } catch (_: Throwable) {
-            0
-        }
-        val tagTextId = try {
-            if (ridClazz != null) XposedHelpers.getStaticIntField(ridClazz, "tag_text") else 0
-        } catch (_: Throwable) {
-            0
-        }
-
-        val openMethod = fatClazz.declaredMethods.firstOrNull { m ->
-            m.name == "m25082a" &&
-                m.parameterTypes.size == 2 &&
-                android.content.Context::class.java.isAssignableFrom(m.parameterTypes[0]) &&
-                (m.parameterTypes[1] == Int::class.javaPrimitiveType || m.parameterTypes[1] == Int::class.java)
-        } ?: return
-
-        openMethod.isAccessible = true
-
-        try {
-            XposedHelpers.findAndHookMethod(
-                cardClazz,
-                "onClick",
-                android.view.View::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val v = param.args.getOrNull(0) as? android.view.View ?: return
-                        val id = try { v.id } catch (_: Throwable) { 0 }
-
-                        // Do not interfere with menu actions.
-                        if ((moreId != 0 && id == moreId) || (tagTextId != 0 && id == tagTextId)) return
-
-                        val ctx = v.context ?: return
-                        val self = param.thisObject ?: return
-
-                        val itemObj = try {
-                            XposedHelpers.getObjectField(self, "f44218a")
-                        } catch (_: Throwable) {
-                            null
-                        } ?: return
-
-                        val avidStr = try {
-                            XposedHelpers.getObjectField(itemObj, "param") as? String
-                        } catch (_: Throwable) {
-                            null
-                        } ?: return
-
-                        try {
-                            PlayurlFixer.setLastClickedAid(avidStr)
-                        } catch (_: Throwable) {
-                        }
-
-                        val avidLong = avidStr.toLongOrNull() ?: return
-                        if (avidLong <= 0L) return
-
-                        // Best-effort: only handle when original route is a normal video click.
-                        val clickedDislike = try {
-                            (XposedHelpers.getBooleanField(itemObj, "clickedDislike"))
-                        } catch (_: Throwable) {
-                            false
-                        }
-                        if (clickedDislike) return
-
-                        val key = "avid=$avidLong"
-                        if (cardClickLoggedOnce.add(key)) {
-                            XposedBridge.log("RecBiliOld: VideoCard click fix open avid=$avidLong")
-                        }
-
-                        try {
-                            if (avidLong <= Int.MAX_VALUE.toLong()) {
-                                openMethod.invoke(null, ctx, avidLong.toInt())
-                                param.result = null
-                            } else {
-                                // Oversized avid: keep uri route but seed for oversized hook.
-                                oversizedAidAtomicRef.set(avidLong)
-                                PlayurlFixer.ingestOversizedAid(avidLong.toString())
-                                val m = openUriMethod
-                                if (m != null) {
-                                    m.isAccessible = true
-                                    val u = android.net.Uri.parse("bilibili://video/$avidLong")
-                                    m.invoke(null, ctx, u)
-                                    param.result = null
-                                }
-                            }
-                        } catch (t: Throwable) {
-                            XposedBridge.log(t)
-                        }
-                    }
-                }
-            )
-
-            XposedBridge.log("RecBiliOld: VideoCard click avid hook installed")
-        } catch (t: Throwable) {
-            XposedBridge.log(t)
-        }
-    }
-
     private fun hookOkHttpVerboseIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val cl = lpparam.classLoader
-        val interceptorClazz = XposedHelpers.findClassIfExists("okhttp3.Interceptor", cl) ?: return
-        val builderClazz = XposedHelpers.findClassIfExists("okhttp3.OkHttpClient\$Builder", cl)
-            ?: XposedHelpers.findClassIfExists("okhttp3.OkHttpClient.Builder", cl)
-            ?: return
-
-        val interceptorProxy = java.lang.reflect.Proxy.newProxyInstance(
-            cl,
-            arrayOf(interceptorClazz)
-        ) { _, method, args ->
-            if (method.name != "intercept" || args == null || args.isEmpty()) {
-                return@newProxyInstance if (args == null) method.invoke(this) else method.invoke(this, *args)
-            }
-            val chain = args[0]
-            val request = try {
-                XposedHelpers.callMethod(chain, "request")
-            } catch (_: Throwable) {
-                null
-            }
-            val url = try {
-                val u = XposedHelpers.callMethod(request, "url")
-                u?.toString()
-            } catch (_: Throwable) {
-                null
-            }
-            val shouldLog = isVerboseNetworkEnabledForce() && !url.isNullOrBlank()
-            if (shouldLog) {
-                try {
-                    val mtd = XposedHelpers.callMethod(request, "method")?.toString()
-                    val headers = XposedHelpers.callMethod(request, "headers")?.toString()
-                    XposedBridge.log("RecBiliOld: [okhttp] -> ${mtd ?: "?"} ${url ?: "<null>"} headers=${headers ?: "<null>"}")
-                } catch (_: Throwable) {
-                }
-            }
-
-            val resp = try {
-                XposedHelpers.callMethod(chain, "proceed", request)
-            } catch (t: Throwable) {
-                if (shouldLog) XposedBridge.log(t)
-                throw t
-            }
-
-            if (shouldLog) {
-                try {
-                    val code = XposedHelpers.callMethod(resp, "code")?.toString()
-                    val peeked = try {
-                        XposedHelpers.callMethod(resp, "peekBody", 65536L)
-                    } catch (_: Throwable) {
-                        null
-                    }
-                    val bodyStr = try {
-                        XposedHelpers.callMethod(peeked, "string") as? String
-                    } catch (_: Throwable) {
-                        null
-                    }
-                    XposedBridge.log(
-                        "RecBiliOld: [okhttp] <- http=${code ?: "?"} ${url ?: "<null>"} body=${bodyStr?.take(3000) ?: "<null>"}"
-                    )
-                } catch (t: Throwable) {
-                    XposedBridge.log(t)
-                }
-            }
-            resp
-        }
-
-        try {
-            XposedBridge.log("RecBiliOld: okhttp verbose hook (Builder.build) installing...")
-            XposedHelpers.findAndHookMethod(
-                builderClazz,
-                "build",
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        try {
-                            if (!isVerboseNetworkEnabledForce()) return
-                            XposedHelpers.callMethod(param.thisObject, "addNetworkInterceptor", interceptorProxy)
-                        } catch (_: Throwable) {
-                            try {
-                                XposedHelpers.callMethod(param.thisObject, "addInterceptor", interceptorProxy)
-                            } catch (_: Throwable) {
-                            }
-                        }
-                    }
-                }
-            )
-            XposedBridge.log("RecBiliOld: okhttp verbose hook (Builder.build) installed")
-        } catch (t: Throwable) {
-            XposedBridge.log(t)
-        }
+        XposedHooksOkHttpVerbose.hookOkHttpVerboseIfPresent(lpparam)
     }
 
     private fun isVerboseNetworkEnabledForce(): Boolean {
@@ -2761,95 +2225,7 @@ class XposedInit : IXposedHookLoadPackage {
     }
 
     private fun hookOkHttpRealCallVerboseIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val cl = lpparam.classLoader
-        val realCallClazz = XposedHelpers.findClassIfExists("okhttp3.RealCall", cl)
-            ?: XposedHelpers.findClassIfExists("okhttp3.internal.connection.RealCall", cl)
-            ?: return
-        val callbackClazz = XposedHelpers.findClassIfExists("okhttp3.Callback", cl)
-
-        try {
-            XposedBridge.log("RecBiliOld: okhttp verbose hook (RealCall) installing... realCall=${realCallClazz.name}")
-
-            XposedHelpers.findAndHookMethod(
-                realCallClazz,
-                "execute",
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        try {
-                            if (!isVerboseNetworkEnabledForce()) return
-                            val req = XposedHelpers.callMethod(param.thisObject, "request")
-                            val url = try { XposedHelpers.callMethod(req, "url")?.toString() } catch (_: Throwable) { null }
-                            if (url.isNullOrBlank()) return
-                            val mtd = try { XposedHelpers.callMethod(req, "method")?.toString() } catch (_: Throwable) { null }
-                            val headers = try { XposedHelpers.callMethod(req, "headers")?.toString() } catch (_: Throwable) { null }
-                            XposedBridge.log("RecBiliOld: [realcall] -> ${mtd ?: "?"} ${url ?: "<null>"} headers=${headers ?: "<null>"}")
-                        } catch (_: Throwable) {
-                        }
-                    }
-
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        try {
-                            if (!isVerboseNetworkEnabledForce()) return
-                            val resp = param.result ?: return
-                            val req = XposedHelpers.callMethod(param.thisObject, "request")
-                            val url = try { XposedHelpers.callMethod(req, "url")?.toString() } catch (_: Throwable) { null }
-                            if (url.isNullOrBlank()) return
-                            val code = try { XposedHelpers.callMethod(resp, "code")?.toString() } catch (_: Throwable) { null }
-                            val peeked = try { XposedHelpers.callMethod(resp, "peekBody", 65536L) } catch (_: Throwable) { null }
-                            val bodyStr = try { XposedHelpers.callMethod(peeked, "string") as? String } catch (_: Throwable) { null }
-                            XposedBridge.log("RecBiliOld: [realcall] <- http=${code ?: "?"} ${url ?: "<null>"} body=${bodyStr?.take(3000) ?: "<null>"}")
-                        } catch (t: Throwable) {
-                            XposedBridge.log(t)
-                        }
-                    }
-                }
-            )
-        } catch (t: Throwable) {
-            XposedBridge.log(t)
-        }
-
-        if (callbackClazz != null) {
-            try {
-                XposedHelpers.findAndHookMethod(
-                    realCallClazz,
-                    "enqueue",
-                    callbackClazz,
-                    object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!isVerboseNetworkEnabledForce()) return
-                            val orig = param.args.getOrNull(0) ?: return
-                            val proxy = java.lang.reflect.Proxy.newProxyInstance(
-                                cl,
-                                arrayOf(callbackClazz),
-                                java.lang.reflect.InvocationHandler { _, method, args ->
-                                    try {
-                                        if (method.name == "onResponse" && args != null && args.size >= 2) {
-                                            val call = args[0]
-                                            val resp = args[1]
-                                            val req = try { XposedHelpers.callMethod(call, "request") } catch (_: Throwable) { null }
-                                            val url = try { XposedHelpers.callMethod(req, "url")?.toString() } catch (_: Throwable) { null }
-                                            if (!url.isNullOrBlank()) {
-                                                val code = try { XposedHelpers.callMethod(resp, "code")?.toString() } catch (_: Throwable) { null }
-                                                val peeked = try { XposedHelpers.callMethod(resp, "peekBody", 65536L) } catch (_: Throwable) { null }
-                                                val bodyStr = try { XposedHelpers.callMethod(peeked, "string") as? String } catch (_: Throwable) { null }
-                                                XposedBridge.log("RecBiliOld: [realcall-cb] <- http=${code ?: "?"} ${url ?: "<null>"} body=${bodyStr?.take(3000) ?: "<null>"}")
-                                            }
-                                        }
-                                    } catch (t: Throwable) {
-                                        XposedBridge.log(t)
-                                    }
-                                    if (args == null) method.invoke(orig) else method.invoke(orig, *args)
-                                }
-                            )
-                            param.args[0] = proxy
-                        }
-                    }
-                )
-                XposedBridge.log("RecBiliOld: okhttp verbose hook (RealCall.enqueue) installed")
-            } catch (t: Throwable) {
-                XposedBridge.log(t)
-            }
-        }
+        XposedHooksOkHttpVerbose.hookOkHttpRealCallVerboseIfPresent(lpparam)
     }
 
     private fun findClassAny(cl: ClassLoader, vararg names: String): Class<*>? {
@@ -3002,240 +2378,39 @@ class XposedInit : IXposedHookLoadPackage {
     }
 
     private fun hookBundledOkHttpViewResponseIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val cl = lpparam.classLoader
-        val callClazz = findClassAny(cl, "bl.elo", "p000bl.elo")
-        val callbackClazz = findClassAny(cl, "bl.ekv", "p000bl.ekv")
-
-        if (callClazz == null || callbackClazz == null) {
-            hookBundledOkHttpWhenLoaded(cl)
-            return
-        }
-
-        hookBundledOkHttpWithClasses(cl, callClazz, callbackClazz)
+        XposedHooksBundledOkHttp.hookBundledOkHttpViewResponseIfPresent(
+            lpparam,
+            findClassAny = { cl, names -> findClassAny(cl, *names) },
+            hookBundledOkHttpWithClasses = { cl, callClazz, callbackClazz ->
+                hookBundledOkHttpWithClasses(cl, callClazz, callbackClazz)
+            },
+            hookBundledOkHttpWhenLoaded = { cl ->
+                hookBundledOkHttpWhenLoaded(cl)
+            }
+        )
     }
 
     private fun hookBundledOkHttpWhenLoaded(cl: ClassLoader) {
-        val installed = AtomicReference(false)
-
-        fun tryInstall() {
-            if (installed.get() == true) return
-            val callClazz = findClassAny(cl, "bl.elo", "p000bl.elo") ?: return
-            val callbackClazz = findClassAny(cl, "bl.ekv", "p000bl.ekv") ?: return
-            if (installed.compareAndSet(false, true)) {
-                hookBundledOkHttpWithClasses(cl, callClazz, callbackClazz)
+        XposedHooksBundledOkHttp.hookBundledOkHttpWhenLoaded(
+            cl,
+            findClassAny = { cc, names -> findClassAny(cc, *names) },
+            hookBundledOkHttpWithClasses = { cc, callClazz, callbackClazz ->
+                hookBundledOkHttpWithClasses(cc, callClazz, callbackClazz)
             }
-        }
-
-        try {
-            XposedHelpers.findAndHookMethod(
-                ClassLoader::class.java,
-                "loadClass",
-                String::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        try {
-                            val name = param.args[0] as? String ?: return
-                            if (name == "p000bl.elo" || name == "p000bl.ekv" || name == "bl.elo" || name == "bl.ekv") {
-                                tryInstall()
-                            }
-                        } catch (t: Throwable) {
-                            XposedBridge.log(t)
-                        }
-                    }
-                }
-            )
-        } catch (t: Throwable) {
-            XposedBridge.log(t)
-        }
-
-        tryInstall()
+        )
     }
 
     private fun hookBundledOkHttpWithClasses(cl: ClassLoader, callClazz: Class<*>, callbackClazz: Class<*>) {
-        XposedBridge.log("RecBiliOld: bundled okhttp hook installed call=${callClazz.name} cb=${callbackClazz.name}")
-
-        val responseClazz = XposedHelpers.findClassIfExists("p000bl.elr", cl)
-            ?: XposedHelpers.findClassIfExists("bl.elr", cl)
-        val requestClazz = XposedHelpers.findClassIfExists("p000bl.elp", cl)
-            ?: XposedHelpers.findClassIfExists("bl.elp", cl)
-
-        // sync execute-like: 0 args, non-void return
-        try {
-            for (m in callClazz.declaredMethods) {
-                if (m.parameterTypes.isNotEmpty()) continue
-                if (m.returnType == java.lang.Void.TYPE) continue
-                
-                // Avoid hooking the 'request()' getter which returns Request object
-                if (requestClazz != null && m.returnType == requestClazz) continue
-                
-                // Prefer hooking only the 'execute()' method which returns Response object
-                if (responseClazz != null && m.returnType != responseClazz) continue
-                
-                if (hookedMethods.contains(m)) continue
-                XposedBridge.hookMethod(
-                    m,
-                    object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            try {
-                                try {
-                                    val req = XposedHelpers.callMethod(param.thisObject, "a")
-                                    val httpUrl = XposedHelpers.callMethod(req, "a")
-                                    val url = httpUrl?.toString()
-                                    if (!url.isNullOrBlank()) {
-                                        if (isBangumiGetSourceEpisode0(url)) {
-                                            XposedBridge.log("RecBiliOld: match bundled get_source episode_id=0 (sync) url=$url")
-                                            val fakeJson = "{\"code\":0,\"message\":\"0\",\"ttl\":1,\"data\":{}}"
-                                            
-                                            var resp = try {
-                                                buildBundledElrJsonResponse(cl, req, fakeJson)
-                                            } catch (t: Throwable) {
-                                                XposedBridge.log("RecBiliOld: buildBundledElrJsonResponse threw exception:")
-                                                XposedBridge.log(t)
-                                                null
-                                            }
-                                            
-                                            if (resp == null) {
-                                                XposedBridge.log("RecBiliOld: buildBundledElrJsonResponse failed, trying buildBundledElrJsonResponseNoRequest...")
-                                                // Try to build a dummy response object to use as template
-                                                try {
-                                                    val responseClazz = XposedHelpers.findClassIfExists("p000bl.elr", cl)
-                                                        ?: XposedHelpers.findClassIfExists("bl.elr", cl)
-                                                    if (responseClazz != null) {
-                                                        XposedBridge.log("RecBiliOld: found response class ${responseClazz.name}")
-                                                    } else {
-                                                        XposedBridge.log("RecBiliOld: could not find response class bl.elr")
-                                                    }
-                                                } catch (t: Throwable) {
-                                                    XposedBridge.log(t)
-                                                }
-                                            }
-                                            
-                                            if (resp != null) {
-                                                param.result = resp
-                                                XposedBridge.log("RecBiliOld: short-circuit bundled get_source episode_id=0 -> synthetic elr (SUCCESS)")
-                                                return
-                                            } else {
-                                                XposedBridge.log("RecBiliOld: short-circuit bundled get_source episode_id=0 failed: all methods returned null")
-                                                XposedBridge.log("RecBiliOld: WARNING: get_source will proceed and may block playback!")
-                                            }
-                                        } else if (url.contains("bangumi.bilibili.com/api/get_source", ignoreCase = true)) {
-                                            XposedBridge.log("RecBiliOld: bundled get_source detected but NOT episode_id=0 (sync) url=$url")
-                                        }
-                                    } else {
-                                        XposedBridge.log("RecBiliOld: bundled sync hook: url is null or blank, req=$req httpUrl=$httpUrl")
-                                    }
-                                } catch (t: Throwable) {
-                                    XposedBridge.log("RecBiliOld: bundled get_source short-circuit check failed (sync)"); XposedBridge.log(t)
-                                }
-                                ingestBundledRequest(param.thisObject)
-                            } catch (t: Throwable) {
-                                XposedBridge.log(t)
-                            }
-                        }
-
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            try {
-                                val resp = param.result ?: return
-                                val replaced = ingestBundledResponse(resp)
-                                if (replaced != null) {
-                                    param.result = replaced
-                                }
-                            } catch (t: Throwable) {
-                                XposedBridge.log(t)
-                            }
-                        }
-                    }
-                )
-                hookedMethods.add(m)
-            }
-        } catch (t: Throwable) {
-            XposedBridge.log(t)
-        }
-
-        // async enqueue-like: 1 arg that is callback interface
-        try {
-            for (m in callClazz.declaredMethods) {
-                val p = m.parameterTypes
-                if (p.size != 1) continue
-                if (!p[0].isAssignableFrom(callbackClazz) && p[0] != callbackClazz) continue
-                XposedBridge.hookMethod(
-                    m,
-                    object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            try {
-                                val req = try {
-                                    XposedHelpers.callMethod(param.thisObject, "mo21912a")
-                                } catch (_: Throwable) {
-                                    null
-                                }
-                                val url = try {
-                                    val httpUrl = if (req != null) XposedHelpers.callMethod(req, "m22166a") else null
-                                    httpUrl?.toString()
-                                } catch (_: Throwable) {
-                                    null
-                                }
-                                if (req != null && !url.isNullOrBlank()) {
-                                    if (isBangumiGetSourceEpisode0(url)) {
-                                        XposedBridge.log("RecBiliOld: match bundled get_source episode_id=0 (async) url=$url")
-                                        val originalCb = param.args[0] ?: return
-                                        val resp = buildBundledElrJsonResponse(
-                                            cl,
-                                            req,
-                                            "{\"code\":0,\"message\":\"0\",\"ttl\":1,\"data\":{}}"
-                                        )
-                                        if (resp != null) {
-                                            try {
-                                                XposedHelpers.callMethod(originalCb, "mo18458a", param.thisObject, resp)
-                                                XposedBridge.log("RecBiliOld: short-circuit bundled get_source episode_id=0 (async) -> synthetic elr")
-                                                param.result = null
-                                                return
-                                            } catch (_: Throwable) {
-                                            }
-                                        } else {
-                                            XposedBridge.log("RecBiliOld: short-circuit bundled get_source episode_id=0 failed: build synthetic elr returned null (async)")
-                                        }
-                                    } else if (url.contains("bangumi.bilibili.com/api/get_source", ignoreCase = true)) {
-                                        XposedBridge.log("RecBiliOld: bundled get_source detected but NOT episode_id=0 (async) url=$url")
-                                    }
-                                } else if (req != null && url.isNullOrBlank()) {
-                                    XposedBridge.log("RecBiliOld: bundled async hook: url is null or blank, req=$req")
-                                }
-
-                                ingestBundledRequest(param.thisObject)
-                                val originalCb = param.args[0] ?: return
-                                val cbProxy = java.lang.reflect.Proxy.newProxyInstance(
-                                    cl,
-                                    arrayOf(callbackClazz),
-                                    java.lang.reflect.InvocationHandler { _, method, args ->
-                                        try {
-                                            if (args != null) {
-                                                for (i in args.indices) {
-                                                    val a = args[i]
-                                                    if (a != null) {
-                                                        val replaced = ingestBundledResponse(a)
-                                                        if (replaced != null) {
-                                                            args[i] = replaced
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        } catch (t: Throwable) {
-                                            XposedBridge.log(t)
-                                        }
-                                        if (args == null) method.invoke(originalCb) else method.invoke(originalCb, *args)
-                                    }
-                                )
-                                param.args[0] = cbProxy
-                            } catch (t: Throwable) {
-                                XposedBridge.log(t)
-                            }
-                        }
-                    }
-                )
-            }
-        } catch (t: Throwable) {
-            XposedBridge.log(t)
-        }
+        XposedHooksBundledOkHttp.hookBundledOkHttpWithClasses(
+            cl,
+            callClazz,
+            callbackClazz,
+            hookedMethods,
+            isBangumiGetSourceEpisode0 = { url -> isBangumiGetSourceEpisode0(url) },
+            buildBundledElrJsonResponse = { ccl, req, json -> buildBundledElrJsonResponse(ccl, req, json) },
+            ingestBundledRequest = { callObj -> ingestBundledRequest(callObj) },
+            ingestBundledResponse = { respObj -> ingestBundledResponse(respObj) }
+        )
     }
 
     private fun ingestBundledRequest(callObj: Any) {
@@ -3998,9 +3173,9 @@ class XposedInit : IXposedHookLoadPackage {
                             }
 
                             val (http, fetched) = try {
-                                PlayurlFixer.fetchReplyLegacyMainList(
+                                PlayurlFixer.fetchReplyLegacyMainListCloneAndResign(
+                                    originalUrl = url,
                                     oid = oid,
-                                    type = type,
                                     pn = pn,
                                     ps = ps,
                                     sort = sort,
@@ -4016,7 +3191,31 @@ class XposedInit : IXposedHookLoadPackage {
                                     if (bundledCommentPatchedOnce.add("rescue-reply-legacy:" + url)) {
                                         XposedBridge.log("RecBiliOld: rescued legacy /x/v2/reply pn=$pn oid=$oid type=$type")
                                     }
-                                    return patchReplyMainListFields(fetchedRoot.toJSONString())
+                                    val s = patchReplyMainListFields(fetchedRoot.toJSONString())
+                                    // Ensure page fields are usable for legacy hasMore calculation.
+                                    try {
+                                        val rr = JSONObject.parseObject(s)
+                                        val d = rr?.getJSONObject("data")
+                                        val page = d?.getJSONObject("page")
+                                        val count0 = (try { page?.getLongValue("count") } catch (_: Throwable) { null }) ?: 0L
+                                        val acount0 = (try { page?.getLongValue("acount") } catch (_: Throwable) { null }) ?: 0L
+                                        val num0 = (try { page?.getIntValue("num") } catch (_: Throwable) { null }) ?: 0
+                                        val size0 = (try { page?.getIntValue("size") } catch (_: Throwable) { null }) ?: 0
+                                        val psInt = ps?.toIntOrNull() ?: 20
+                                        val pnInt = pn.toIntOrNull() ?: 1
+                                        if (page != null) {
+                                            if (num0 <= 0) page["num"] = pnInt
+                                            if (size0 <= 0) page["size"] = psInt
+                                            val cachedTotal = try { PlayurlFixer.getCommentTotalCount(oid = oid, type = type) } catch (_: Throwable) { null }
+                                            if ((count0 <= 0L || acount0 <= 0L) && cachedTotal != null && cachedTotal > 0L) {
+                                                page["count"] = cachedTotal
+                                                page["acount"] = cachedTotal
+                                            }
+                                        }
+                                        return rr?.toJSONString() ?: s
+                                    } catch (_: Throwable) {
+                                    }
+                                    return s
                                 }
                             }
 
@@ -4086,7 +3285,13 @@ class XposedInit : IXposedHookLoadPackage {
                                     val cursor = d.getJSONObject("cursor")
                                     val pn1 = parseQueryParam(url, "pn")?.toIntOrNull() ?: 1
                                     val ps1 = ps?.toIntOrNull() ?: 20
-                                    val allCount = try { cursor?.getLongValue("all_count") } catch (_: Throwable) { 0L }
+                                    val allCount = (try { cursor?.getLongValue("all_count") } catch (_: Throwable) { null }) ?: 0L
+                                    try {
+                                        if (allCount > 0L) {
+                                            PlayurlFixer.putCommentTotalCount(oid = oid, type = type, totalCount = allCount)
+                                        }
+                                    } catch (_: Throwable) {
+                                    }
                                     val pageObj = JSONObject()
                                     pageObj["num"] = pn1
                                     pageObj["size"] = ps1
@@ -4168,58 +3373,44 @@ class XposedInit : IXposedHookLoadPackage {
 
     private fun patchReplyMainListFields(json: String): String {
         // Ensure list fields are never null for old models (BiliCommentList.mList / mHotList).
-        var s = json
-        try {
-            s = s.replace("\"replies\":null", "\"replies\":[]")
-            s = s.replace("\"hots\":null", "\"hots\":[]")
+        return try {
+            val root = try { JSONObject.parseObject(json) } catch (_: Throwable) { null } ?: return json
+            val data = try { root.getJSONObject("data") } catch (_: Throwable) { null } ?: return json
 
-            val dataPos = s.indexOf("\"data\":{")
-            if (dataPos >= 0) {
-                val insertAt = dataPos + "\"data\":{".length
-                val dataHead = s.substring(insertAt, minOf(s.length, insertAt + 300))
-                val hasReplies = dataHead.contains("\"replies\"")
-                val hasHots = dataHead.contains("\"hots\"")
-                if (!hasReplies || !hasHots) {
-                    val sb = StringBuilder(s.length + 64)
-                    sb.append(s, 0, insertAt)
-                    if (!hasReplies) sb.append("\"replies\":[],")
-                    if (!hasHots) sb.append("\"hots\":[],")
-                    sb.append(s.substring(insertAt))
-                    s = sb.toString()
-                }
+            val repliesVal = try { data.get("replies") } catch (_: Throwable) { null }
+            if (repliesVal == null) {
+                data["replies"] = com.alibaba.fastjson.JSONArray()
             }
+            val hotsVal = try { data.get("hots") } catch (_: Throwable) { null }
+            if (hotsVal == null) {
+                data["hots"] = com.alibaba.fastjson.JSONArray()
+            }
+
+            root.toJSONString()
         } catch (_: Throwable) {
+            json
         }
-        return s
     }
 
     private fun patchReplyReplyListFields(json: String): String {
         // Ensure list fields are never null for old models (BiliCommentList.mList / mHotList).
-        var s = json
-        try {
-            // Normalize explicit nulls first.
-            s = s.replace("\"replies\":null", "\"replies\":[]")
-            s = s.replace("\"hots\":null", "\"hots\":[]")
+        return try {
+            val root = try { JSONObject.parseObject(json) } catch (_: Throwable) { null } ?: return json
+            val data = try { root.getJSONObject("data") } catch (_: Throwable) { null } ?: return json
 
-            // If replies/hots missing under data, inject empty arrays.
-            val dataPos = s.indexOf("\"data\":{")
-            if (dataPos >= 0) {
-                val insertAt = dataPos + "\"data\":{".length
-                val dataHead = s.substring(insertAt, minOf(s.length, insertAt + 300))
-                val hasReplies = dataHead.contains("\"replies\"")
-                val hasHots = dataHead.contains("\"hots\"")
-                if (!hasReplies || !hasHots) {
-                    val sb = StringBuilder(s.length + 64)
-                    sb.append(s, 0, insertAt)
-                    if (!hasReplies) sb.append("\"replies\":[],")
-                    if (!hasHots) sb.append("\"hots\":[],")
-                    sb.append(s.substring(insertAt))
-                    s = sb.toString()
-                }
+            val repliesVal = try { data.get("replies") } catch (_: Throwable) { null }
+            if (repliesVal == null) {
+                data["replies"] = com.alibaba.fastjson.JSONArray()
             }
+            val hotsVal = try { data.get("hots") } catch (_: Throwable) { null }
+            if (hotsVal == null) {
+                data["hots"] = com.alibaba.fastjson.JSONArray()
+            }
+
+            root.toJSONString()
         } catch (_: Throwable) {
+            json
         }
-        return s
     }
 
     private fun percentEncodeForWbi(s: String): String {
@@ -4644,41 +3835,7 @@ class XposedInit : IXposedHookLoadPackage {
     }
 
     private fun tryPatchBundledListParamAvidIfNeeded(url: String, body: String): String? {
-        try {
-            val t = body.trimStart()
-            if (!t.startsWith("{")) return null
-            if (!t.contains("\"param\"")) return null
-
-            val root = JSONObject.parseObject(t) ?: return null
-            if (root.getIntValue("code") != 0) return null
-
-            val dataArr = root.getJSONArray("data") ?: return null
-            if (dataArr.isEmpty) return null
-
-            var changed = false
-            for (i in 0 until dataArr.size) {
-                val it = dataArr.getJSONObject(i) ?: continue
-                val param = it.getString("param")?.trim()
-                if (param.isNullOrBlank()) continue
-                if (!param.all { ch -> ch.isDigit() }) continue
-
-                val aidLong = param.toLongOrNull() ?: continue
-                if (aidLong <= 0L) continue
-
-                if (aidLong > Int.MAX_VALUE.toLong()) {
-                    val signed32 = (aidLong and 0xFFFF_FFFFL).toInt().toString()
-                    if (signed32 != param) {
-                        it["param"] = signed32
-                        changed = true
-                    }
-                }
-            }
-
-            if (!changed) return null
-            return root.toJSONString()
-        } catch (_: Throwable) {
-            return null
-        }
+        return XposedHooksListPatch.tryPatchBundledListParamAvidIfNeeded(url, body)
     }
 
     private fun tryDumpBundledRequestHeaders(reqObj: Any?): String? {
@@ -4969,12 +4126,12 @@ class XposedInit : IXposedHookLoadPackage {
                                 val intent = (param.thisObject as? android.app.Activity)?.intent
                                 val avid = intent?.getIntExtra("avid", -1) ?: -1
                                 if (avid == Int.MAX_VALUE) {
-                                    if (oversizedAidAtomicRef.get() == null) {
+                                    if (XposedSharedState.oversizedAidAtomicRef.get() == null) {
                                         val persisted = PlayurlFixer.getPersistedAidBvidForJump()
                                         val persistedAid = persisted?.first
                                         val realAid = persistedAid?.toLongOrNull()
                                         if (realAid != null && realAid > 0) {
-                                            oversizedAidAtomicRef.set(realAid)
+                                            XposedSharedState.oversizedAidAtomicRef.set(realAid)
                                             PlayurlFixer.ingestOversizedAid(realAid.toString())
                                             XposedBridge.log("RecBiliOld: seed oversized aid from persisted aid=$realAid")
                                         }
@@ -4986,7 +4143,7 @@ class XposedInit : IXposedHookLoadPackage {
                                 val seg = data?.lastPathSegment
                                 val parsed = seg?.toLongOrNull()
                                 if (parsed != null && parsed > Int.MAX_VALUE.toLong()) {
-                                    oversizedAidAtomicRef.set(parsed)
+                                    XposedSharedState.oversizedAidAtomicRef.set(parsed)
                                     intent.putExtra("avid", Int.MAX_VALUE)
                                     PlayurlFixer.ingestOversizedAid(parsed.toString())
                                     XposedBridge.log("RecBiliOld: oversized avid detected real=$parsed, inject Int.MAX_VALUE")
@@ -5011,14 +4168,14 @@ class XposedInit : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
-                            val realAid = oversizedAidAtomicRef.get() ?: return
+                            val realAid = XposedSharedState.oversizedAidAtomicRef.get() ?: return
                             if (realAid <= 0L) return
 
                             val obj = param.thisObject
                             val synthetic = Int.MAX_VALUE.toString()
                             if (!replaceQueryMapValueIfEquals(obj, key = "aid", expectedOldValue = synthetic, newValue = realAid.toString())) return
 
-                            oversizedAidAtomicRef.set(null)
+                            XposedSharedState.oversizedAidAtomicRef.set(null)
                             XposedBridge.log("RecBiliOld: patched x/v2/view aid=$realAid")
                         } catch (t: Throwable) {
                             XposedBridge.log(t)
@@ -5067,7 +4224,7 @@ class XposedInit : IXposedHookLoadPackage {
                         } else if (isBangumiGetSourceEpisode0(url)) {
                             val playable = PlayurlFixer.getLastExtractedPlayableUrl()
                             if (!playable.isNullOrBlank()) {
-                                luaGetSourceBypassMap[param.thisObject] = playable
+                                XposedSharedState.luaGetSourceBypassMap[param.thisObject] = playable
                                 XposedBridge.log("RecBiliOld: arm lua get_source bypass url=$url playable=${playable.take(200)}")
                             } else {
                                 XposedBridge.log("RecBiliOld: lua get_source episode_id=0 but no cached playable url url=$url")
@@ -5125,7 +4282,7 @@ class XposedInit : IXposedHookLoadPackage {
                             param.result = 200
                             return
                         }
-                        val bypass = luaGetSourceBypassMap[param.thisObject]
+                        val bypass = XposedSharedState.luaGetSourceBypassMap[param.thisObject]
                         if (!bypass.isNullOrBlank()) {
                             param.result = 200
                         }
@@ -5146,7 +4303,7 @@ class XposedInit : IXposedHookLoadPackage {
                             param.result = "{}"
                             return
                         }
-                        val bypass = luaGetSourceBypassMap[param.thisObject]
+                        val bypass = XposedSharedState.luaGetSourceBypassMap[param.thisObject]
                         if (!bypass.isNullOrBlank()) {
                             param.result = "{}"
                         }
@@ -5179,7 +4336,7 @@ class XposedInit : IXposedHookLoadPackage {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     try {
                         if (PlayurlFixer.shouldIntercept(param.thisObject)) return
-                        val playable = luaGetSourceBypassMap[param.thisObject]
+                        val playable = XposedSharedState.luaGetSourceBypassMap[param.thisObject]
                         if (playable.isNullOrBlank()) return
 
                         // Minimal JSON that upstream parsers usually accept: we mainly need to unblock the state machine.
@@ -5188,7 +4345,7 @@ class XposedInit : IXposedHookLoadPackage {
                             "\"}}"
 
                         param.result = json.toByteArray(Charsets.UTF_8)
-                        luaGetSourceBypassMap.remove(param.thisObject)
+                        XposedSharedState.luaGetSourceBypassMap.remove(param.thisObject)
                         XposedBridge.log("RecBiliOld: bypass lua bangumi get_source episode_id=0 -> served playable url=${playable.take(200)}")
                     } catch (t: Throwable) {
                         XposedBridge.log(t)
@@ -5199,105 +4356,78 @@ class XposedInit : IXposedHookLoadPackage {
     }
 
     private fun hookEpisodeParamsResolver(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val cl = lpparam.classLoader
-        XposedBridge.log("RecBiliOld: attempting to find EpisodeParamsResolver (bl.fol) in ${lpparam.packageName}")
-        
-        // Try direct lookup first based on provided source code structure
-        // bl.fol is the obfuscated name in the provided sources. 
-        // In some cases, the class might be accessed via a different name or not loaded yet.
-        var resolverClass = XposedHelpers.findClassIfExists("bl.fol", cl)
-            ?: XposedHelpers.findClassIfExists("p000bl.fol", cl)
+        XposedHooksEpisodeParamsResolver.hookEpisodeParamsResolver(lpparam)
+    }
 
-        if (resolverClass == null) {
-            // Debug: print some classes in bl package to see if we can find any
-            try {
-                 val indicator = XposedHelpers.findClassIfExists("bl.elr", cl)
-                 XposedBridge.log("RecBiliOld: debug check - bl.elr found=${indicator != null}")
-            } catch(e: Throwable) {}
-            
-            XposedBridge.log("RecBiliOld: bl.fol not found, skipping EpisodeParamsResolver hook")
+    private fun hookRankingListAvidFixIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
+        val cl = lpparam.classLoader
+        XposedBridge.log("RecBiliOld: attempting to find RankVideoListFragment\$ViewHolder in ${lpparam.packageName}")
+
+        val viewHolderClass = XposedHelpers.findClassIfExists("tv.danmaku.bili.p046ui.rank.RankVideoListFragment\$ViewHolder", cl)
+            ?: XposedHelpers.findClassIfExists("tv.danmaku.bili.ui.rank.RankVideoListFragment\$ViewHolder", cl)
+
+        if (viewHolderClass == null) {
+            XposedBridge.log("RecBiliOld: RankVideoListFragment\$ViewHolder not found, skipping ranking list avid fix")
             return
         }
 
-        XposedBridge.log("RecBiliOld: Found EpisodeParamsResolver: ${resolverClass.name}")
+        XposedBridge.log("RecBiliOld: Found RankVideoListFragment\$ViewHolder: ${viewHolderClass.name}")
 
-        // Find the resolve method: a(Context, ResolveMediaResourceParams, ResolveResourceExtra)
-        val resolveMethod = resolverClass.declaredMethods.find { m ->
-            m.parameterTypes.size == 3 &&
-            android.content.Context::class.java.isAssignableFrom(m.parameterTypes[0])
-            // We assume the other 2 args are complex types from the library
+        val targetMethod = viewHolderClass.declaredMethods.find { m ->
+            m.name == "m49647a" &&
+            m.parameterTypes.size == 4 &&
+            android.content.Context::class.java.isAssignableFrom(m.parameterTypes[0]) &&
+            String::class.java.isAssignableFrom(m.parameterTypes[1]) &&
+            String::class.java.isAssignableFrom(m.parameterTypes[2]) &&
+            String::class.java.isAssignableFrom(m.parameterTypes[3])
         } ?: run {
-             XposedBridge.log("RecBiliOld: EpisodeParamsResolver resolve method not found")
-             return
+            XposedBridge.log("RecBiliOld: RankVideoListFragment\$ViewHolder.m49647a method not found")
+            return
         }
 
-        XposedBridge.hookMethod(resolveMethod, object : XC_MethodHook() {
+        XposedBridge.hookMethod(targetMethod, object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 try {
-                    val extra = param.args[2] ?: return
-                    
-                    // Heuristic: Check if this is a mis-routed normal video.
-                    // Mis-routed videos have a valid AVID (usually large number) but an invalid Episode ID (0).
-                    // We scan the 'extra' object's methods to find these values.
-                    
-                    var hasAvid = false
-                    var hasZeroEpId = false
-                    
-                    // We look for no-arg methods returning int or long in extra first
-                    extra.javaClass.declaredMethods.forEach { m ->
-                        if (m.parameterTypes.isEmpty() && 
-                           (m.returnType == Long::class.javaPrimitiveType || m.returnType == Int::class.javaPrimitiveType || 
-                            m.returnType == Long::class.java || m.returnType == Int::class.java)) {
-                            
-                            try {
-                                m.isAccessible = true
-                                val res = m.invoke(extra)
-                                val value = when (res) {
-                                    is Number -> res.toLong()
-                                    else -> -1L
-                                }
-                                
-                                if (value > 100000) {
-                                    hasAvid = true
-                                } else if (value == 0L) {
-                                    // Potential Zero Ep ID in extra params
-                                    hasZeroEpId = true
-                                }
-                            } catch (_: Throwable) {}
+                    val context = param.args[0] as? android.content.Context ?: return
+                    val paramStr = param.args[1] as? String ?: return
+                    val title = param.args[2] as? String ?: return
+                    val cover = param.args[3] as? String ?: return
+
+                    // Parse the param field as a long instead of int
+                    val avidLong = paramStr.toLongOrNull()
+                    if (avidLong != null && avidLong > Int.MAX_VALUE.toLong()) {
+                        XposedBridge.log("RecBiliOld: Ranking list avid fix - converting long avid: $avidLong")
+                        
+                        // Store the full avid for later use
+                        try {
+                            PlayurlFixer.ingestOversizedAid(avidLong.toString())
+                            XposedSharedState.oversizedAidAtomicRef.set(avidLong)
+                        } catch (t: Throwable) {
+                            XposedBridge.log("RecBiliOld: Failed to store oversized avid: $t")
                         }
-                    }
-
-                    // If avid is not found in extra, it might be in the main params object (args[1])
-                    if (!hasAvid && param.args.size >= 2 && param.args[1] != null) {
-                         val paramsObj = param.args[1]
-                         paramsObj.javaClass.declaredMethods.forEach { m ->
-                            if (m.parameterTypes.isEmpty() && 
-                               (m.returnType == Long::class.javaPrimitiveType || m.returnType == Int::class.javaPrimitiveType || 
-                                m.returnType == Long::class.java || m.returnType == Int::class.java)) {
-                                try {
-                                    m.isAccessible = true
-                                    val res = m.invoke(paramsObj)
-                                    val value = when (res) {
-                                        is Number -> res.toLong()
-                                        else -> -1L
-                                    }
-                                    if (value > 100000) hasAvid = true
-                                    // Note: We intentionally DO NOT check for zero EpId in paramsObj to avoid false positives 
-                                    // (like unrelated flags/counters being 0). The EpId 0 is specific to the 'extra' object.
-                                } catch (_: Throwable) {}
-                            }
-                         }
-                    }
-
-                    if (hasZeroEpId) {
-                        if (hasAvid) {
-                            XposedBridge.log("RecBiliOld: Correcting mis-routed normal video in EpisodeParamsResolver (avid found, epId zero) -> SKIPPING")
+                        
+                        // Convert to signed 32-bit int for the intent
+                        val signed32Int = (avidLong and 0xFFFF_FFFFL).toInt()
+                        
+                        // Create BiliVideoDetail with the converted avid
+                        val biliVideoDetail = try {
+                            val biliVideoDetailClass = XposedHelpers.findClass("tv.danmaku.bili.p046ui.video.api.BiliVideoDetail", cl)
+                            XposedHelpers.callStaticMethod(biliVideoDetailClass, "create", signed32Int, title, cover)
+                        } catch (t: Throwable) {
+                            XposedBridge.log("RecBiliOld: Failed to create BiliVideoDetail: $t")
+                            return
+                        }
+                        
+                        // Call fat.m25107a with the corrected BiliVideoDetail
+                        try {
+                            val fatClass = XposedHelpers.findClass("p000bl.fat", cl)
+                            XposedHelpers.callStaticMethod(fatClass, "m25107a", context, biliVideoDetail, "fwe.f27847x")
+                            
+                            // Skip the original method call
                             param.result = null
-                        } else {
-                            // Even if we didn't find Avid > 100000 in the params, episode_id=0 is almost certainly invalid for a Bangumi request.
-                            // It's safer to block it to prevent the invalid get_source call that breaks playback.
-                            XposedBridge.log("RecBiliOld: Correcting mis-routed normal video in EpisodeParamsResolver (no avid found, but epId zero) -> SKIPPING")
-                            param.result = null
+                            XposedBridge.log("RecBiliOld: Ranking list avid fix applied - avid: $avidLong -> $signed32Int")
+                        } catch (t: Throwable) {
+                            XposedBridge.log("RecBiliOld: Failed to call fat.m25107a: $t")
                         }
                     }
                 } catch (t: Throwable) {
@@ -5307,8 +4437,5 @@ class XposedInit : IXposedHookLoadPackage {
         })
     }
 
-    private val oversizedAidAtomicRef = AtomicReference<Long?>(null)
-
-    private val luaGetSourceBypassMap: MutableMap<Any, String> =
-        Collections.synchronizedMap(WeakHashMap())
+    // shared state moved to XposedSharedState
 }

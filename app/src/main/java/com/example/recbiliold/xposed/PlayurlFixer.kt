@@ -3,41 +3,25 @@ package com.example.recbiliold.xposed
 import de.robv.android.xposed.XposedBridge
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
 import java.lang.ref.WeakReference
-import java.net.HttpURLConnection
 import java.net.URI
-import java.net.URL
-import java.security.MessageDigest
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicReference
 
 object PlayurlFixer {
-    private data class InterceptInfo(
-        val legacyUrl: String,
-        val legacyHeaders: MutableMap<String, String> = LinkedHashMap(),
-        var responseBytes: ByteArray? = null,
-    )
 
-    private data class CommentContext(
-        val oid: String?,
-        val rpid: String?,
-        val type: String?,
-        val ts: Long,
-    )
-
-    private data class DurlInfo(
-        val url: String,
-        val timelength: Long?,
-        val length: Long?,
-        val size: Long?,
-    )
+    private const val APP_KEY_ANDROID = "1d8b6e7d45233436"
 
     private val interceptMap = WeakHashMap<Any, InterceptInfo>()
 
     private val aidOverrideMap = WeakHashMap<Any, String>()
+
+    private val commentTotalCountCache: MutableMap<String, Long> = Collections.synchronizedMap(object : LinkedHashMap<String, Long>(128, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean {
+            return size > 400
+        }
+    })
 
     private val low32AidToFullAid: MutableMap<Long, String> = Collections.synchronizedMap(object : LinkedHashMap<Long, String>(256, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, String>?): Boolean {
@@ -49,13 +33,19 @@ object PlayurlFixer {
         try {
             val a = fullAid.toLongOrNull() ?: return
             if (a <= 0L) return
-            val key = (a and 0xFFFF_FFFFL)
-            low32AidToFullAid[key] = a.toString()
+            val low = a and 0xFFFF_FFFFL
+            low32AidToFullAid[low] = a.toString()
         } catch (_: Throwable) {
         }
     }
 
-    private data class AidBvid(val aid: String?, val bvid: String?)
+    fun seedLow32AidMappingFromFullAid(fullAid: String?) {
+        try {
+            val s = fullAid?.trim()?.takeIf { it.isNotBlank() } ?: return
+            putLow32AidMapping(s)
+        } catch (_: Throwable) {
+        }
+    }
 
     private fun avToBv(aid: Long): String? {
         return try {
@@ -120,6 +110,27 @@ object PlayurlFixer {
 
     fun getLastCommentContextType(): String? {
         return try { lastCommentContextRef.get()?.type } catch (_: Throwable) { null }
+    }
+
+    fun putCommentTotalCount(oid: String?, type: String?, totalCount: Long?) {
+        try {
+            val o = oid?.trim()?.takeIf { it.isNotBlank() } ?: return
+            val t = type?.trim()?.takeIf { it.isNotBlank() } ?: return
+            val c = totalCount ?: return
+            if (c <= 0L) return
+            commentTotalCountCache["$t:$o"] = c
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun getCommentTotalCount(oid: String?, type: String?): Long? {
+        return try {
+            val o = oid?.trim()?.takeIf { it.isNotBlank() } ?: return null
+            val t = type?.trim()?.takeIf { it.isNotBlank() } ?: return null
+            commentTotalCountCache["$t:$o"]
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     @Volatile
@@ -867,53 +878,12 @@ object PlayurlFixer {
             params["qn"] = qn.toString()
         }
 
-        val (imgKey, subKey) = getWbiKeys()
-        val signedParams = encWbi(params, imgKey, subKey)
-
+        val signedParams = PlayurlFixerSigning.signWbiParams(params)
         return base + "?" + toQueryString(signedParams)
     }
 
-    @Volatile
-    private var wbiKeyCache: Pair<String, String>? = null
-
-    @Volatile
-    private var wbiKeyCacheTsMs: Long = 0L
-
-    private fun getWbiKeys(): Pair<String, String> {
-        val now = System.currentTimeMillis()
-        val cached = wbiKeyCache
-        if (cached != null && now - wbiKeyCacheTsMs < 10 * 60 * 1000L) {
-            return cached
-        }
-
-        val navJson = httpGet(
-            "https://api.bilibili.com/x/web-interface/nav",
-            headers = mapOf(
-                "User-Agent" to "Mozilla/5.0",
-                "Referer" to "https://www.bilibili.com",
-            )
-        )
-        val jo = JSONObject(navJson)
-        val data = jo.optJSONObject("data") ?: JSONObject()
-        val wbiImg = data.optJSONObject("wbi_img") ?: JSONObject()
-        val imgUrl = wbiImg.optString("img_url", "")
-        val subUrl = wbiImg.optString("sub_url", "")
-
-        val imgKey = imgUrl.substringAfterLast('/').substringBefore('.')
-        val subKey = subUrl.substringAfterLast('/').substringBefore('.')
-
-        if (imgKey.isBlank() || subKey.isBlank()) {
-            throw IllegalStateException("missing wbi keys")
-        }
-        val out = imgKey to subKey
-        wbiKeyCache = out
-        wbiKeyCacheTsMs = now
-        return out
-    }
-
     fun signWbiParams(params: Map<String, String>): Map<String, String> {
-        val (imgKey, subKey) = getWbiKeys()
-        return encWbi(params, imgKey, subKey)
+        return PlayurlFixerSigning.signWbiParams(params)
     }
 
     fun fetchCommentWbiMain(
@@ -923,26 +893,18 @@ object PlayurlFixer {
         ps: String?,
         nohot: String?,
     ): Pair<Int, String> {
-        val baseParams = LinkedHashMap<String, String>()
-        baseParams["oid"] = oid
-        baseParams["type"] = type
-        baseParams["mode"] = mode
-        if (!ps.isNullOrBlank()) baseParams["ps"] = ps
-        if (!nohot.isNullOrBlank()) baseParams["nohot"] = nohot
+        return PlayurlFixerCommentApi.fetchCommentWbiMain(oid, type, mode, ps, nohot)
+    }
 
-        val signed = signWbiParams(baseParams)
-        val url = "https://api.bilibili.com/x/v2/reply/wbi/main?" + signed.entries.joinToString("&") { (k, v) ->
-            percentEncode(k) + "=" + percentEncode(v)
-        }
-
-        val headers = linkedMapOf(
-            "Accept" to "application/json",
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-            "Referer" to "https://www.bilibili.com/",
-            "Origin" to "https://www.bilibili.com",
-        )
-
-        return httpGetWithCode(url, headers)
+    fun fetchReplyLegacyMainListCloneAndResign(
+        originalUrl: String,
+        oid: String,
+        pn: String?,
+        ps: String?,
+        sort: String?,
+        nohot: String?,
+    ): Pair<Int, String> {
+        return PlayurlFixerCommentApi.fetchReplyLegacyMainListCloneAndResign(originalUrl, oid, pn, ps, sort, nohot)
     }
 
     fun fetchReplyLegacyMainList(
@@ -953,26 +915,7 @@ object PlayurlFixer {
         sort: String?,
         nohot: String?,
     ): Pair<Int, String> {
-        val qp = LinkedHashMap<String, String>()
-        qp["oid"] = oid
-        qp["type"] = type
-        if (!pn.isNullOrBlank()) qp["pn"] = pn
-        if (!ps.isNullOrBlank()) qp["ps"] = ps
-        if (!sort.isNullOrBlank()) qp["sort"] = sort
-        if (!nohot.isNullOrBlank()) qp["nohot"] = nohot
-
-        val url = "https://api.bilibili.com/x/v2/reply?" + qp.entries.joinToString("&") { (k, v) ->
-            percentEncode(k) + "=" + percentEncode(v)
-        }
-
-        val headers = linkedMapOf(
-            "Accept" to "application/json",
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-            "Referer" to "https://www.bilibili.com/",
-            "Origin" to "https://www.bilibili.com",
-        )
-
-        return httpGetWithCode(url, headers)
+        return PlayurlFixerCommentApi.fetchReplyLegacyMainList(oid, type, pn, ps, sort, nohot)
     }
 
     fun fetchReplyReplyLegacy(
@@ -982,70 +925,7 @@ object PlayurlFixer {
         pn: String?,
         ps: String?,
     ): Pair<Int, String> {
-        val qp = LinkedHashMap<String, String>()
-        qp["oid"] = oid
-        qp["type"] = type
-        qp["root"] = root
-        if (!pn.isNullOrBlank()) qp["pn"] = pn
-        if (!ps.isNullOrBlank()) qp["ps"] = ps
-        qp["sort"] = "1"
-
-        val url = "https://api.bilibili.com/x/v2/reply/reply?" + qp.entries.joinToString("&") { (k, v) ->
-            percentEncode(k) + "=" + percentEncode(v)
-        }
-
-        val headers = linkedMapOf(
-            "Accept" to "application/json",
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-            "Referer" to "https://www.bilibili.com/",
-            "Origin" to "https://www.bilibili.com",
-        )
-
-        return httpGetWithCode(url, headers)
-    }
-
-    private fun encWbi(
-        params: Map<String, String>,
-        imgKey: String,
-        subKey: String,
-    ): Map<String, String> {
-        val mixinKey = genMixinKey(imgKey + subKey)
-        val wts = (System.currentTimeMillis() / 1000L).toString()
-
-        val mutable = params.toMutableMap()
-        mutable["wts"] = wts
-
-        val filtered = mutable.mapValues { (_, v) ->
-            v.filterNot { ch -> ch == '!' || ch == '\'' || ch == '(' || ch == ')' || ch == '*' }
-        }
-
-        val sorted = filtered.toSortedMap()
-        val queryToSign = sorted.entries.joinToString("&") { (k, v) ->
-            "${percentEncode(k)}=${percentEncode(v)}"
-        }
-
-        val wRid = md5Hex(queryToSign + mixinKey)
-
-        val out = filtered.toMutableMap()
-        out["w_rid"] = wRid
-        out["wts"] = wts
-        return out
-    }
-
-    private fun genMixinKey(rawWbiKey: String): String {
-        val tab = intArrayOf(
-            46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
-            33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
-            61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
-            36, 20, 34, 44, 52
-        )
-        val sb = StringBuilder()
-        for (i in tab) {
-            if (i in rawWbiKey.indices) {
-                sb.append(rawWbiKey[i])
-            }
-        }
-        return if (sb.length > 32) sb.substring(0, 32) else sb.toString()
+        return PlayurlFixerCommentApi.fetchReplyReplyLegacy(oid, type, root, pn, ps)
     }
 
     private fun extractPlayableUrlFromWbiPlayurl(json: String): String? {
@@ -1085,123 +965,23 @@ object PlayurlFixer {
         return out
     }
 
-    private fun httpGet(url: String, headers: Map<String, String>): String {
-        return httpGetWithCode(url, headers).second
-    }
-
     private fun httpGetWithCode(url: String, headers: Map<String, String>): Pair<Int, String> {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            instanceFollowRedirects = true
-            connectTimeout = 8000
-            readTimeout = 10000
-            // Ensure UA exists (some endpoints respond differently without it)
-            if (!headers.keys.any { it.equals("User-Agent", ignoreCase = true) }) {
-                setRequestProperty(
-                    "User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-                )
-            }
-            for ((k, v) in headers) {
-                setRequestProperty(k, v)
-            }
-        }
-
-        try {
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val sb = StringBuilder()
-            if (stream != null) {
-                BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { br ->
-                    var line: String?
-                    while (true) {
-                        line = br.readLine() ?: break
-                        sb.append(line)
-                    }
-                }
-            }
-            return code to sb.toString()
-        } finally {
-            conn.disconnect()
-        }
-    }
-
-    private fun httpGetBytesWithCode(url: String, headers: Map<String, String>): Pair<Int, ByteArray> {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            instanceFollowRedirects = true
-            connectTimeout = 8000
-            readTimeout = 10000
-            if (!headers.keys.any { it.equals("User-Agent", ignoreCase = true) }) {
-                setRequestProperty(
-                    "User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-                )
-            }
-            for ((k, v) in headers) {
-                setRequestProperty(k, v)
-            }
-        }
-
-        try {
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val bytes = stream?.readBytes() ?: ByteArray(0)
-            return code to bytes
-        } finally {
-            conn.disconnect()
-        }
+        return PlayurlFixerHttp.httpGetWithCode(url, headers)
     }
 
     private fun parseQuery(query: String): Map<String, String> {
-        if (query.isBlank()) return emptyMap()
-        val out = LinkedHashMap<String, String>()
-        val pairs = query.split('&')
-        for (p in pairs) {
-            if (p.isBlank()) continue
-            val idx = p.indexOf('=')
-            if (idx < 0) {
-                out[p] = ""
-            } else {
-                val k = p.substring(0, idx)
-                val v = p.substring(idx + 1)
-                out[k] = v
-            }
-        }
-        return out
+        return PlayurlFixerUtil.parseQuery(query)
     }
 
     private fun toQueryString(params: Map<String, String>): String {
-        return params.entries.joinToString("&") { (k, v) ->
-            "${percentEncode(k)}=${percentEncode(v)}"
-        }
+        return PlayurlFixerUtil.toQueryString(params)
     }
 
     private fun percentEncode(s: String): String {
-        val unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
-        val sb = StringBuilder()
-        for (ch in s) {
-            if (unreserved.indexOf(ch) >= 0) {
-                sb.append(ch)
-            } else {
-                val bytes = ch.toString().toByteArray(Charsets.UTF_8)
-                for (b in bytes) {
-                    sb.append('%')
-                    sb.append(((b.toInt() shr 4) and 0xF).toString(16).uppercase())
-                    sb.append((b.toInt() and 0xF).toString(16).uppercase())
-                }
-            }
-        }
-        return sb.toString()
+        return PlayurlFixerUtil.percentEncode(s)
     }
 
     private fun md5Hex(s: String): String {
-        val md = MessageDigest.getInstance("MD5")
-        val bytes = md.digest(s.toByteArray(Charsets.UTF_8))
-        val sb = StringBuilder(bytes.size * 2)
-        for (b in bytes) {
-            sb.append(String.format("%02x", b))
-        }
-        return sb.toString()
+        return PlayurlFixerUtil.md5Hex(s)
     }
 }
