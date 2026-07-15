@@ -1,6 +1,7 @@
 package com.example.recbiliold.xposed
 
 import com.alibaba.fastjson.JSONObject
+import com.example.recbiliold.xposed_in.XposedInAppHooks
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -36,6 +37,108 @@ class XposedInit : IXposedHookLoadPackage {
                 null
             }
         }
+    }
+
+    private fun logChunked(title: String, text: String, chunkSize: Int = 3000) {
+        try {
+            XposedBridge.log(title)
+        } catch (_: Throwable) {
+        }
+
+        if (text.isEmpty()) return
+
+        val safeChunk = if (chunkSize <= 0) 3000 else chunkSize
+        var i = 0
+        var idx = 0
+        val total = (text.length + safeChunk - 1) / safeChunk
+        while (idx < text.length) {
+            val end = kotlin.math.min(idx + safeChunk, text.length)
+            val part = text.substring(idx, end)
+            try {
+                XposedBridge.log("$title [${i + 1}/$total]\n$part")
+            } catch (_: Throwable) {
+            }
+            i++
+            idx = end
+        }
+    }
+
+    private fun tryExtractBundledRequestBodyString(reqObj: Any?): String? {
+        if (reqObj == null) return null
+
+        // Avoid heavy reflection / side-effects. Try common accessors & fields.
+        // Many GET requests will have no body.
+        try {
+            // Prefer finding a 0-arg method that returns byte[]/String/CharSequence.
+            for (m in reqObj.javaClass.declaredMethods) {
+                try {
+                    if (m.parameterTypes.isNotEmpty()) continue
+                    val rt = m.returnType
+                    if (rt == java.lang.Void.TYPE) continue
+                    if (
+                        rt == String::class.java ||
+                        CharSequence::class.java.isAssignableFrom(rt) ||
+                        rt == ByteArray::class.java
+                    ) {
+                        m.isAccessible = true
+                        val v = m.invoke(reqObj) ?: continue
+                        val s = when (v) {
+                            is String -> v
+                            is CharSequence -> v.toString()
+                            is ByteArray -> {
+                                if (v.isEmpty()) "" else {
+                                    // Heuristic: don't dump huge or binary-looking bodies.
+                                    val max = 1024 * 1024
+                                    if (v.size > max) return "<body: bytes len=${v.size} (too large)>"
+                                    val str = try { String(v, Charsets.UTF_8) } catch (_: Throwable) { null }
+                                    if (str.isNullOrBlank()) "<body: bytes len=${v.size}>" else str
+                                }
+                            }
+                            else -> null
+                        } ?: continue
+
+                        if (s.isBlank()) continue
+                        // Avoid dumping binary bodies (multipart, protobuf, etc.)
+                        val printableRatio = s.count { it >= ' ' || it == '\n' || it == '\r' || it == '\t' }.toDouble() / s.length
+                        if (printableRatio < 0.85) return "<body: non-text len=${s.length}>"
+                        if (s.length > 1024 * 1024) return "<body: text len=${s.length} (too large)>"
+                        return s
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        } catch (_: Throwable) {
+        }
+
+        try {
+            // Fallback: scan fields for byte[]/String.
+            for (f in reqObj.javaClass.declaredFields) {
+                try {
+                    if (Modifier.isStatic(f.modifiers)) continue
+                    f.isAccessible = true
+                    val v = f.get(reqObj) ?: continue
+                    when (v) {
+                        is String -> if (v.isNotBlank()) return v
+                        is CharSequence -> {
+                            val s = v.toString()
+                            if (s.isNotBlank()) return s
+                        }
+                        is ByteArray -> {
+                            if (v.isEmpty()) continue
+                            val max = 1024 * 1024
+                            if (v.size > max) return "<body: bytes len=${v.size} (too large)>"
+                            val s = try { String(v, Charsets.UTF_8) } catch (_: Throwable) { null }
+                            if (!s.isNullOrBlank()) return s
+                            return "<body: bytes len=${v.size}>"
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        } catch (_: Throwable) {
+        }
+
+        return null
     }
 
     private fun hookCommentActivityIntentCaptureIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -1100,6 +1203,70 @@ class XposedInit : IXposedHookLoadPackage {
         }
     }
 
+    private fun tryExtractJsonBodyFromFields(obj: Any?): String? {
+        if (obj == null) return null
+
+        fun looksLikeJson(s: String?): Boolean {
+            if (s.isNullOrBlank()) return false
+            val t = s.trimStart()
+            return t.startsWith("{") || t.startsWith("[")
+        }
+
+        fun fromByteArray(b: ByteArray?): String? {
+            if (b == null || b.isEmpty()) return null
+            val s = try { String(b, Charsets.UTF_8) } catch (_: Throwable) { null }
+            return if (looksLikeJson(s)) s else null
+        }
+
+        fun fromValue(v: Any?): String? {
+            return when (v) {
+                is String -> if (looksLikeJson(v)) v else null
+                is CharSequence -> {
+                    val s = v.toString()
+                    if (looksLikeJson(s)) s else null
+                }
+                is ByteArray -> fromByteArray(v)
+                else -> null
+            }
+        }
+
+        fun scanFieldsOnce(root: Any): String? {
+            try {
+                for (f in root.javaClass.declaredFields) {
+                    try {
+                        if (Modifier.isStatic(f.modifiers)) continue
+                        f.isAccessible = true
+                        val v = f.get(root)
+                        fromValue(v)?.let { return it }
+                    } catch (_: Throwable) {
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+            return null
+        }
+
+        // depth 0
+        fromValue(obj)?.let { return it }
+        // depth 1
+        scanFieldsOnce(obj)?.let { return it }
+        // depth 2 (safe recursion: fields only)
+        try {
+            for (f in obj.javaClass.declaredFields) {
+                try {
+                    if (Modifier.isStatic(f.modifiers)) continue
+                    f.isAccessible = true
+                    val v = f.get(obj) ?: continue
+                    if (v is String || v is CharSequence || v is ByteArray) continue
+                    scanFieldsOnce(v)?.let { return it }
+                } catch (_: Throwable) {
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return null
+    }
+
     private fun bruteForceExtractBundledElrJson(responseObj: Any): String? {
         fun looksLikeJson(s: String?): Boolean {
             if (s.isNullOrBlank()) return false
@@ -1434,9 +1601,8 @@ class XposedInit : IXposedHookLoadPackage {
                             20
                         }
                     }
-                    val allCount = try { cursor?.getLongValue("all_count") } catch (_: Throwable) { 0L }
-                    pageObj["count"] = allCount
-                    pageObj["acount"] = allCount
+                    pageObj["count"] = cursor.getLongValue("all_count")
+                    pageObj["acount"] = cursor.getLongValue("all_count")
 
                     // Legacy /x/v2/reply expects `page`, and `top` to be either null or a comment object.
                     // wbi/main returns `top` as an object wrapper; set it to null to avoid model mismatch.
@@ -1574,102 +1740,6 @@ class XposedInit : IXposedHookLoadPackage {
         }
     }
 
-    private fun tryExtractJsonBodyFromFields(obj: Any?): String? {
-        if (obj == null) return null
-
-        fun looksLikeJson(s: String?): Boolean {
-            if (s.isNullOrBlank()) return false
-            val t = s.trimStart()
-            return t.startsWith("{") || t.startsWith("[")
-        }
-
-        fun extractFromOne(o: Any): String? {
-            // scan fields only, avoid invoking unknown methods
-            for (f in o.javaClass.declaredFields) {
-                try {
-                    if (java.lang.reflect.Modifier.isStatic(f.modifiers)) continue
-                    f.isAccessible = true
-                    val v = f.get(o) ?: continue
-                    when (v) {
-                        is String -> if (looksLikeJson(v)) return v
-                        is CharSequence -> {
-                            val s = v.toString()
-                            if (looksLikeJson(s)) return s
-                        }
-                        is ByteArray -> {
-                            if (v.isEmpty()) continue
-                            val s = try {
-                                String(v, Charsets.UTF_8)
-                            } catch (_: Throwable) {
-                                null
-                            }
-                            if (looksLikeJson(s)) return s
-                        }
-                        else -> {
-                            // Known safe body containers
-                            val cn = v.javaClass.name
-                            if (cn == "okio.ByteString" || cn.endsWith(".ByteString")) {
-                                val s = try {
-                                    val m = v.javaClass.getDeclaredMethod("utf8")
-                                    m.isAccessible = true
-                                    (m.invoke(v) as? String)
-                                } catch (_: Throwable) {
-                                    null
-                                }
-                                if (looksLikeJson(s)) return s
-                            }
-                            if (cn == "okio.Buffer" || cn.endsWith(".Buffer")) {
-                                val s = try {
-                                    val mClone = v.javaClass.getDeclaredMethod("clone")
-                                    mClone.isAccessible = true
-                                    val cloned = mClone.invoke(v)
-                                    val mRead = cloned.javaClass.getDeclaredMethod("readUtf8")
-                                    mRead.isAccessible = true
-                                    (mRead.invoke(cloned) as? String)
-                                } catch (_: Throwable) {
-                                    null
-                                }
-                                if (looksLikeJson(s)) return s
-                            }
-                        }
-                    }
-                } catch (_: Throwable) {
-                }
-            }
-            return null
-        }
-
-        // depth 0
-        extractFromOne(obj)?.let { return it }
-
-        try {
-            if (obj.javaClass.name == "p000bl.elr" || obj.javaClass.name.endsWith(".elr")) {
-                val s = tryExtractBundledElrBodyString(obj)
-                if (s != null) {
-                    try {
-                        patchBundledResponseBody(obj, s)
-                    } catch (_: Throwable) {
-                    }
-                }
-                if (looksLikeJson(s)) return s
-            }
-        } catch (_: Throwable) {
-        }
-
-        // depth 1
-        for (f in obj.javaClass.declaredFields) {
-            try {
-                if (java.lang.reflect.Modifier.isStatic(f.modifiers)) continue
-                f.isAccessible = true
-                val v = f.get(obj) ?: continue
-                if (v is String || v is CharSequence || v is ByteArray) continue
-                extractFromOne(v)?.let { return it }
-            } catch (_: Throwable) {
-            }
-        }
-        return null
-    }
-
     private fun extractUrlFromObjectFields(root: Any): String? {
         // fast path for bundled okhttp types (avoid field heuristics)
         try {
@@ -1743,7 +1813,11 @@ class XposedInit : IXposedHookLoadPackage {
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
-        if (lpparam.packageName != "tv.danmaku.bili" && lpparam.packageName != "com.bilibili.app.blue") return
+        if (
+            lpparam.packageName != "tv.danmaku.bili" &&
+            lpparam.packageName != "com.bilibili.app.blue" &&
+            lpparam.packageName != "com.bilibili.app.in"
+        ) return
 
         val pn = getMyProcessName() ?: lpparam.processName ?: "<unknown>"
         val pid = try { android.os.Process.myPid() } catch (_: Throwable) { -1 }
@@ -1789,6 +1863,12 @@ class XposedInit : IXposedHookLoadPackage {
 
         try {
             XposedBridge.log("RecBiliOld: starting hooks for ${lpparam.packageName}")
+
+            if (lpparam.packageName == "com.bilibili.app.in") {
+                XposedInAppHooks.hookOversizedAvidInvalidFixIfPresent(lpparam)
+                return
+            }
+
             hookEpisodeParamsResolver(lpparam)
             hookLuaHttpIfPresent(lpparam)
             hookOversizedAvidIfPresent(lpparam)
@@ -1814,7 +1894,7 @@ class XposedInit : IXposedHookLoadPackage {
         } catch (t: Throwable) {
             XposedBridge.log(t)
         }
-    }
+     }
 
     private fun hookFatVideoBangumiSanitizerIfPresent(lpparam: XC_LoadPackage.LoadPackageParam) {
         val cl = lpparam.classLoader
@@ -2476,6 +2556,34 @@ class XposedInit : IXposedHookLoadPackage {
             val urlCandidate = extractUrlFromRequestLike(reqCandidate) ?: url0
             val url = urlCandidate ?: return
 
+            // Repair view/danmaku parameters BEFORE the request goes out.
+            // - view APIs: ensure aid uses cached full 64-bit aid
+            // - danmaku APIs: ensure aid uses cached full 64-bit aid; ensure oid uses cached full cid
+            try {
+                maybeRewriteViewAndDanmakuForBundledCall(callObj, reqCandidate, url)
+            } catch (t: Throwable) {
+                XposedBridge.log(t)
+            }
+
+            // Verbose network dump (bundled stack). Chunked to bypass logcat line limits.
+            try {
+                val method = tryExtractBundledRequestMethod(reqCandidate)
+                val headersDump = tryDumpBundledRequestHeaders(reqCandidate)
+                val bodyDump = tryExtractBundledRequestBodyString(reqCandidate)
+
+                logChunked(
+                    "RecBiliOld: [net][req] ${method ?: "?"} ${url}",
+                    buildString {
+                        append("url=").append(url).append('\n')
+                        append("method=").append(method ?: "<null>").append('\n')
+                        append("headers=\n").append(headersDump ?: "<null>").append('\n')
+                        append("body=\n").append(bodyDump ?: "<null>")
+                    }
+                )
+            } catch (t: Throwable) {
+                XposedBridge.log(t)
+            }
+
             try {
                 if (url.contains("/x/v2/reply", ignoreCase = true)) {
                     if (bundledUrlFailOnce.add("bundled-reply-req:" + url.take(160))) {
@@ -2506,6 +2614,103 @@ class XposedInit : IXposedHookLoadPackage {
         } finally {
             bundledIngestGuard.set(false)
             bundledIngestGlobalGuard.set(false)
+        }
+    }
+
+    private fun maybeRewriteViewAndDanmakuForBundledCall(callObj: Any, reqObj: Any, url: String) {
+        val fullAid = XposedSharedState.oversizedAidAtomicRef.get() ?: 0L
+        val fullCid = XposedSharedState.fullCidAtomicRef.get() ?: 0L
+
+        val isView = url.contains("/x/intl/view", ignoreCase = true) ||
+            url.contains("/x/v2/view", ignoreCase = true) ||
+            url.contains("/x/web-interface/view", ignoreCase = true)
+
+        val isDm = url.contains("/x/v2/dm/view", ignoreCase = true) ||
+            url.contains("/x/v2/dm/list.so", ignoreCase = true)
+
+        if (!isView && !isDm) return
+
+        // Build a mutable query map from raw URL.
+        val base = url.substringBefore('?', url)
+        val query0 = url.substringAfter('?', "")
+        val qp = LinkedHashMap<String, String>()
+        if (query0.isNotBlank()) {
+            for (p in query0.split('&')) {
+                if (p.isBlank()) continue
+                val idx = p.indexOf('=')
+                val k = if (idx >= 0) p.substring(0, idx) else p
+                val v = if (idx >= 0) p.substring(idx + 1) else ""
+                qp[k] = v
+            }
+        }
+
+        var changed = false
+        if (fullAid > 0L) {
+            val curAid = qp["aid"]
+            // Only overwrite when it looks like a 32-bit/truncated aid.
+            val curAidN = curAid?.toLongOrNull()
+            if (curAidN == null || curAidN <= Int.MAX_VALUE.toLong() || curAidN != fullAid) {
+                qp["aid"] = fullAid.toString()
+                changed = true
+            }
+        }
+
+        if (isDm && fullCid > 0L) {
+            val curOid = qp["oid"]
+            val curOidN = curOid?.toLongOrNull()
+            val looksBroken = curOidN == null || curOidN < 0L || curOidN <= Int.MAX_VALUE.toLong()
+            if (looksBroken || curOidN != fullCid) {
+                qp["oid"] = fullCid.toString()
+                changed = true
+            }
+        }
+
+        if (!changed) return
+
+        // If the request uses app sign, re-sign to avoid server rejection.
+        if (qp.containsKey("sign")) {
+            try {
+                val signed = PlayurlFixerSigning.signAppParams(qp)
+                qp.clear()
+                qp.putAll(signed)
+            } catch (t: Throwable) {
+                XposedBridge.log(t)
+            }
+        }
+
+        val newUrl = base + "?" + qp.entries.joinToString("&") { (k, v) -> "$k=$v" }
+
+        val builderObj = try { XposedHelpers.callMethod(reqObj, "m22172f") } catch (_: Throwable) { null } ?: return
+        val builderClazz = builderObj.javaClass
+        val setUrlMethod = builderClazz.declaredMethods.firstOrNull { m ->
+            m.parameterTypes.size == 1 && m.parameterTypes[0] == String::class.java && m.returnType == builderClazz
+        }
+        val buildMethod = builderClazz.declaredMethods.firstOrNull { m ->
+            m.parameterTypes.isEmpty() && m.returnType == reqObj.javaClass
+        }
+        if (setUrlMethod == null || buildMethod == null) return
+        setUrlMethod.isAccessible = true
+        buildMethod.isAccessible = true
+        setUrlMethod.invoke(builderObj, newUrl)
+        val rebuiltReq = buildMethod.invoke(builderObj) ?: return
+
+        var replaced = false
+        try {
+            val f = callObj.javaClass.getDeclaredField("f19632c")
+            f.isAccessible = true
+            f.set(callObj, rebuiltReq)
+            replaced = true
+        } catch (_: Throwable) {
+        }
+
+        if (replaced) {
+            if (isDm) {
+                XposedBridge.log("RecBiliOld: patched danmaku url -> $newUrl")
+            } else {
+                XposedBridge.log("RecBiliOld: patched view url -> $newUrl")
+            }
+        } else {
+            XposedBridge.log("RecBiliOld: view/danmaku rewrite failed: could not replace request field in call=${callObj.javaClass.name}")
         }
     }
 
@@ -3497,6 +3702,46 @@ class XposedInit : IXposedHookLoadPackage {
             }
 
             val url = extractUrlFromObjectFields(responseObj)
+
+            // Verbose response dump (bundled stack). Use safe extraction paths; do not consume source.
+            try {
+                val (code, msg) = getBundledElrCodeMessage(responseObj)
+                val hdrDump = tryDumpBundledResponseHeaders(responseObj)
+
+                // Try to extract a text body without breaking the app; chunk it if available.
+                var bodyStr: String? = null
+                try {
+                    val cached = bundledRespBodyCache[responseObj]
+                    if (!cached.isNullOrBlank()) bodyStr = cached
+                } catch (_: Throwable) {
+                }
+
+                if (bodyStr.isNullOrBlank()) {
+                    try {
+                        // Prefer the existing safe extraction helper. This may return null.
+                        bodyStr = tryExtractJsonBodyFromFields(responseObj)
+                    } catch (_: Throwable) {
+                    }
+                }
+
+                if (!bodyStr.isNullOrBlank()) {
+                    // Best-effort restore to avoid breaking downstream readers.
+                    try { patchBundledResponseBody(responseObj, bodyStr!!) } catch (_: Throwable) {
+                    }
+                }
+
+                val title = "RecBiliOld: [net][resp] http=${code ?: "?"} ${url ?: "<null>"}"
+                val text = buildString {
+                    append("url=").append(url ?: "<null>").append('\n')
+                    append("http=").append(code ?: "<null>").append('\n')
+                    append("msg=").append(msg ?: "<null>").append('\n')
+                    append("headers=\n").append(hdrDump ?: "<null>").append('\n')
+                    append("body=\n").append(bodyStr ?: "<null>")
+                }
+                logChunked(title, text)
+            } catch (t: Throwable) {
+                XposedBridge.log(t)
+            }
 
             // Diagnose actual playback failures: UPOS may return 403/412/404 even if we extracted a playable URL.
             // Log the HTTP status for UPOS resources.
